@@ -4,6 +4,10 @@
 #include "pixel_packer.h"
 #include "logger.h"
 
+#ifdef USE_EPDIY_DRIVER
+  #include "epdiy_gxepd2_bridge.h"
+#endif
+
 // ESP32 sleep functions for light sleep during display refresh
 #include <esp_sleep.h>
 
@@ -23,6 +27,8 @@ static Adafruit_NeoPixel pixel(1, RGBledPin, NEO_GRB + NEO_KHZ800);
   #include "SPI.h"
 static SPIClass hspi(HSPI);
 #endif
+
+#ifndef USE_EPDIY_DRIVER
 
 ///////////////////////
 // ePaper library includes based on type
@@ -317,6 +323,12 @@ GxEPD2_7C<GxEPD2_730c_GDEP073E01, CALC_PAGE_HEIGHT(GxEPD2_730c_GDEP073E01::HEIGH
 
 #endif
 
+#else
+
+static EpdiyDisplay display;
+
+#endif // USE_EPDIY_DRIVER
+
 // Font
 #include <gfxfont.h>
 // #include "fonts/OpenSansSB_12px.h"
@@ -343,6 +355,10 @@ namespace Display
 
 // Track whether partial refresh is requested for direct streaming mode
 static bool directStreamingPartialRefresh = false;
+
+#ifdef USE_EPDIY_DRIVER
+static bool forceFullRefreshAfterWifiScreen = false;
+#endif
 
 #if defined(TYPE_GRAYSCALE)
 // Buffer manager for grayscale-to-BW conversion
@@ -631,6 +647,15 @@ void initDirectStreaming(bool partialRefresh, uint16_t maxRowCount)
   // Set full window for direct writes
   display.setFullWindow();
 
+#ifdef USE_EPDIY_DRIVER
+  if (forceFullRefreshAfterWifiScreen)
+  {
+    display.fillScreen(GxEPD_WHITE);
+    display.epd2.refresh(false);
+    forceFullRefreshAfterWifiScreen = false;
+  }
+#endif
+
 #if defined(TYPE_7C) || defined(TYPE_4C)
   // Enable paged mode for 7C/4C displays - required for incremental row writes
   // Without this, each writeNative call restarts the display buffer from scratch
@@ -715,9 +740,23 @@ void showNoWiFiError(uint64_t sleepSeconds, const String &wikiUrl)
   {
     display.fillRect(0, 0, DISPLAY_RESOLUTION_X, DISPLAY_RESOLUTION_Y, GxEPD_WHITE);
     display.setTextColor(GxEPD_BLACK);
-    display.setFont(&OpenSansSB_20px);
+    if (DISPLAY_RESOLUTION_X >= 1200)
+    {
+      display.setFont(&OpenSansSB_24px);
+    }
+    else
+    {
+      display.setFont(&OpenSansSB_20px);
+    }
     centeredText("Cannot connect to Wi-Fi", DISPLAY_RESOLUTION_X / 2, DISPLAY_RESOLUTION_Y / 2 - 15);
-    display.setFont(&OpenSansSB_16px);
+    if (DISPLAY_RESOLUTION_X >= 1200)
+    {
+      display.setFont(&OpenSansSB_24px);
+    }
+    else
+    {
+      display.setFont(&OpenSansSB_16px);
+    }
     centeredText("Retries in " + String((sleepSeconds + 30) / 60) + " minutes.", DISPLAY_RESOLUTION_X / 2,
                  DISPLAY_RESOLUTION_Y / 2 + 15);
     display.setFont(&OpenSansSB_14px);
@@ -727,6 +766,10 @@ void showNoWiFiError(uint64_t sleepSeconds, const String &wikiUrl)
   delay(100);
   // Disable power supply for ePaper
   Board::setEPaperPowerOn(false);
+
+#ifdef USE_EPDIY_DRIVER
+  forceFullRefreshAfterWifiScreen = true;
+#endif
 }
 
 void showWiFiError(const String &hostname, const String &password, const String &urlWeb, const String &wikiUrl)
@@ -750,7 +793,14 @@ void showWiFiError(const String &hostname, const String &password, const String 
       display.setTextColor(GxEPD_WHITE);
       display.setFont(&OpenSansSB_24px);
       centeredText("No Wi-Fi configured OR connection lost", DISPLAY_RESOLUTION_X / 2, 28);
-      display.setFont(&OpenSansSB_18px);
+      if (DISPLAY_RESOLUTION_X >= 1200)
+      {
+        display.setFont(&OpenSansSB_24px);
+      }
+      else
+      {
+        display.setFont(&OpenSansSB_18px);
+      }
       centeredText("Retries in a few minutes if lost.", DISPLAY_RESOLUTION_X / 2, 64);
       display.setTextColor(GxEPD_BLACK);
       centeredText("To setup or change Wi-Fi configuration", DISPLAY_RESOLUTION_X / 2, 120);
@@ -856,5 +906,9 @@ void showWiFiError(const String &hostname, const String &password, const String 
   delay(100);
   // Disable power supply for ePaper
   Board::setEPaperPowerOn(false);
+
+#ifdef USE_EPDIY_DRIVER
+  forceFullRefreshAfterWifiScreen = true;
+#endif
 }
 } // namespace Display

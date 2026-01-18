@@ -177,6 +177,9 @@ static constexpr const char COLOR_TYPE_STRING[] = XSTR(COLOR_TYPE);
   #define DT_GDEP0565D90 47
   #define DT_GDEY073D46 48
   #define DT_GDEP073E01 49
+  // epdiy displays (parallel interface)
+  #define DT_ED097TC2_EPDIY 100
+  #define DT_ED060XC3_EPDIY 101
 
 // Create DISPLAY_TYPE_STRING constant
 static constexpr const char DISPLAY_TYPE_STRING[] = XSTR(DISPLAY_TYPE);
@@ -185,7 +188,8 @@ static constexpr const char DISPLAY_TYPE_STRING[] = XSTR(DISPLAY_TYPE);
   #define DISPLAY_ID XCAT(DT_, DISPLAY_TYPE)
 
   // Validate DISPLAY_TYPE - DISPLAY_ID will be 0 if DT_<DISPLAY_TYPE> is not defined
-  #if DISPLAY_ID < DT_GDEW0154T8 || DISPLAY_ID > DT_GDEP073E01
+  #if (DISPLAY_ID < DT_GDEW0154T8 || DISPLAY_ID > DT_GDEP073E01) && \
+      (DISPLAY_ID < DT_ED097TC2_EPDIY || DISPLAY_ID > DT_ED060XC3_EPDIY)
     #pragma message("DISPLAY_TYPE: " XSTR(DISPLAY_TYPE))
     #error "DISPLAY_TYPE not supported!"
   #endif

@@ -2,6 +2,7 @@
 
 #include "display.h"
 #include "logger.h"
+#include "epdiy_i2c_bridge.h"
 #include "sensor.h"
 
 // M5Stack CoreInk
@@ -17,9 +18,10 @@
 static SFE_MAX1704X lipo(MAX1704X_MAX17048);
 #endif
 
-#if (defined ESP32S3Adapter) || (defined ES3ink) || (defined SVERIO_PAPERBOARD_SPI)
+#if (defined ESP32S3Adapter) || (defined ES3ink) || (defined SVERIO_PAPERBOARD_SPI) || (defined SVERIO_PAPERBOARD_EPDIY)
   #include <esp_adc_cal.h>
   #include <soc/adc_channel.h>
+  #include <driver/adc.h>
 #endif
 
 namespace Board
@@ -40,7 +42,7 @@ void setupHW()
   M5.begin(false, false, true);
   Display::initM5();
   M5.update();
-#elif !defined SEEEDSTUDIO_RETERMINAL
+#elif !defined SEEEDSTUDIO_RETERMINAL && !defined SVERIO_PAPERBOARD_EPDIY
   pinMode(ePaperPowerPin, OUTPUT);
 #endif
 
@@ -56,6 +58,10 @@ void setupHW()
 #endif
 
 #ifdef SENSOR
+#if defined(SVERIO_PAPERBOARD_EPDIY)
+  Wire.begin(PIN_SDA, PIN_SCL);
+  epdiy_set_i2c_initialized(true);
+#endif
   Sensor::getInstance().init();
 #endif
 
@@ -68,6 +74,9 @@ void setEPaperPowerOn(bool on)
   // use HIGH/LOW notation for better readability
 #if (defined ES3ink) || (defined MakerBadge_revD) || (defined SVERIO_PAPERBOARD_SPI)
   digitalWrite(ePaperPowerPin, on ? LOW : HIGH);
+#elif defined SVERIO_PAPERBOARD_EPDIY
+  // Power management is handled by epdiy library via TPS65185
+  // This function is a no-op for epdiy boards
 #elif (!defined M5StackCoreInk) && (!defined SEEEDSTUDIO_RETERMINAL)
   digitalWrite(ePaperPowerPin, on ? HIGH : LOW);
 #endif
@@ -231,6 +240,36 @@ float getBatteryVoltage()
   volt = ((float)analogReadMilliVolts(vBatPin) * dividerRatio) / 1000;
   digitalWrite(enableBattery, LOW);
   pinMode(enableBattery, INPUT);
+
+#elif defined SVERIO_PAPERBOARD_EPDIY
+  // Battery measurement with calibrated ADC on SVERIO Paperboard EPDIY
+  // Matches original Paperboard implementation
+  Logger::log<Logger::Level::DEBUG, Logger::Topic::BATTERY>("Reading on SVERIO Paperboard EPDIY board\n");
+
+  esp_adc_cal_characteristics_t adc_cal;
+
+  // Enable battery voltage measurement circuit via GPIO2
+  digitalWrite(enableBattery, HIGH);
+  pinMode(enableBattery, OUTPUT);
+  delay(200); // Allow measurement circuit to stabilize
+
+  // Configure and calibrate ADC
+  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12, 0, &adc_cal);
+  adc1_config_channel_atten(ADC1_GPIO1_CHANNEL, ADC_ATTEN_DB_12);
+
+  // Read raw ADC value and convert to millivolts
+  uint32_t raw = adc1_get_raw(ADC1_GPIO1_CHANNEL);
+  uint32_t millivolts = esp_adc_cal_raw_to_voltage(raw, &adc_cal);
+
+  // Disable measurement circuit
+  digitalWrite(enableBattery, LOW);
+
+  // Apply voltage divider compensation and calibration ratio
+  // Formula from original Paperboard: (upper + lower) / lower / 1000 * mV * dividerRatio
+  const uint32_t upper_divider = 1000;
+  const uint32_t lower_divider = 1000;
+  volt = (float)(upper_divider + lower_divider) / lower_divider / 1000 * millivolts;
+  volt = volt * dividerRatio;
 
 #else
   volt = (analogReadMilliVolts(vBatPin) * dividerRatio / 1000);

@@ -24,17 +24,22 @@
 #include "state_manager.h"
 #include "streaming_handler.h"
 
-#ifdef TYPE_BW
-  #include <GxEPD2_BW.h>
-#elif defined TYPE_3C
-  #include <GxEPD2_3C.h>
-#elif defined TYPE_4C
-  #include <GxEPD2_4C.h>
-#elif defined TYPE_GRAYSCALE
-  #include "GxEPD2_4G_4G.h"
-  #include "GxEPD2_4G_BW.h"
-#elif defined TYPE_7C
-  #include <GxEPD2_7C.h>
+// GxEPD2 color constants - needed for color conversion functions
+#ifdef USE_EPDIY_DRIVER
+  #include "epdiy_gxepd2_bridge.h"
+#else
+  #ifdef TYPE_BW
+    #include <GxEPD2_BW.h>
+  #elif defined TYPE_3C
+    #include <GxEPD2_3C.h>
+  #elif defined TYPE_4C
+    #include <GxEPD2_4C.h>
+  #elif defined TYPE_GRAYSCALE
+    #include "GxEPD2_4G_4G.h"
+    #include "GxEPD2_4G_BW.h"
+  #elif defined TYPE_7C
+    #include <GxEPD2_7C.h>
+  #endif
 #endif
 
 #include <pngle.h>
