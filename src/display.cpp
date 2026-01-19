@@ -356,10 +356,6 @@ namespace Display
 // Track whether partial refresh is requested for direct streaming mode
 static bool directStreamingPartialRefresh = false;
 
-#ifdef USE_EPDIY_DRIVER
-static bool forceFullRefreshAfterWifiScreen = false;
-#endif
-
 #if defined(TYPE_GRAYSCALE)
 // Buffer manager for grayscale-to-BW conversion
 static struct
@@ -496,6 +492,10 @@ void resetPixelColor(uint16_t n, uint8_t r, uint8_t g, uint8_t b)
 
 void drawPixel(int16_t xCord, int16_t yCord, uint16_t color) { display.drawPixel(xCord, yCord, color); }
 
+#ifdef USE_EPDIY_DRIVER
+void drawPixel8bit(int16_t xCord, int16_t yCord, uint8_t gray) { display.drawPixel8bit(xCord, yCord, gray); }
+#endif
+
 void drawQrCode(const char *qrStr, int qrSize, int yCord, int xCord, byte qrSizeMulti)
 {
   QRCode qrcode;
@@ -592,9 +592,15 @@ void enableLightSleepDuringRefresh(bool enable)
 
 bool supportsDirectStreaming()
 {
+#ifdef USE_EPDIY_DRIVER
+  // Epdiy uses direct framebuffer access with full 16-level grayscale support
+  // Direct streaming would reduce this to 4 levels, so disable it
+  return false;
+#else
   // All display types now support direct streaming
   // BW, Grayscale, 3C, 4C, and 7C displays support the setPaged()/writeNative()/refresh() API
   return true;
+#endif
 }
 
 void initDirectStreaming(bool partialRefresh, uint16_t maxRowCount)
@@ -646,15 +652,6 @@ void initDirectStreaming(bool partialRefresh, uint16_t maxRowCount)
 
   // Set full window for direct writes
   display.setFullWindow();
-
-#ifdef USE_EPDIY_DRIVER
-  if (forceFullRefreshAfterWifiScreen)
-  {
-    display.fillScreen(GxEPD_WHITE);
-    display.epd2.refresh(false);
-    forceFullRefreshAfterWifiScreen = false;
-  }
-#endif
 
 #if defined(TYPE_7C) || defined(TYPE_4C)
   // Enable paged mode for 7C/4C displays - required for incremental row writes
@@ -766,10 +763,6 @@ void showNoWiFiError(uint64_t sleepSeconds, const String &wikiUrl)
   delay(100);
   // Disable power supply for ePaper
   Board::setEPaperPowerOn(false);
-
-#ifdef USE_EPDIY_DRIVER
-  forceFullRefreshAfterWifiScreen = true;
-#endif
 }
 
 void showWiFiError(const String &hostname, const String &password, const String &urlWeb, const String &wikiUrl)
@@ -907,8 +900,5 @@ void showWiFiError(const String &hostname, const String &password, const String 
   // Disable power supply for ePaper
   Board::setEPaperPowerOn(false);
 
-#ifdef USE_EPDIY_DRIVER
-  forceFullRefreshAfterWifiScreen = true;
-#endif
 }
 } // namespace Display

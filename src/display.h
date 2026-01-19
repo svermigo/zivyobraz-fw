@@ -10,6 +10,7 @@
 // #define COLOR_TYPE 4C        // 4 colors - black, white, red and yellow
 // #define COLOR_TYPE GRAYSCALE // grayscale - 4 colors
 // #define COLOR_TYPE 7C        // 7 colors
+// #define COLOR_TYPE 8G        // 8-level grayscale (epdiy driver only)
 
 //////////////////////////////////////////////////////////////
 // Uncomment for correct ePaper you have
@@ -93,6 +94,7 @@
   #define CT_3C 2
   #define CT_4C 3
   #define CT_7C 4
+  #define CT_8G 5
 
 // Create COLOR_TYPE_STRING constant
 static constexpr const char COLOR_TYPE_STRING[] = XSTR(COLOR_TYPE);
@@ -109,6 +111,8 @@ static constexpr const char COLOR_TYPE_STRING[] = XSTR(COLOR_TYPE);
     #define TYPE_GRAYSCALE
   #elif COLOR_ID == CT_7C
     #define TYPE_7C
+  #elif COLOR_ID == CT_8G
+    #define TYPE_8G
   #else
     #pragma message("COLOR_TYPE: " XSTR(COLOR_TYPE))
     #error "COLOR_TYPE not supported!"
@@ -223,6 +227,13 @@ void resetPixelColor(uint16_t n, uint8_t r, uint8_t g, uint8_t b);
 
 // Drawing functions
 void drawPixel(int16_t xCord, int16_t yCord, uint16_t color);
+#ifdef USE_EPDIY_DRIVER
+// Direct 8-bit grayscale pixel drawing for epdiy (16 levels: 0x00, 0x11, ... 0xFF)
+// Note: USE_EPDIY_DRIVER (hardware) is always used together with TYPE_8G (color model)
+// - TYPE_8G: Used in image_handler.cpp for color mapping logic
+// - USE_EPDIY_DRIVER: Used here for hardware-specific API functions
+void drawPixel8bit(int16_t xCord, int16_t yCord, uint8_t gray);
+#endif
 void drawQrCode(const char *qrStr, int qrSize, int yCord, int xCord, byte qrSizeMulti = 1);
 void setTextPos(const String &text, int xCord, int yCord);
 void centeredText(const String &text, int xCord, int yCord);

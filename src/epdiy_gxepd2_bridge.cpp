@@ -216,6 +216,14 @@ void EpdiyDisplay::drawPixel(int16_t x, int16_t y, uint16_t color)
   epd_draw_pixel(x, y, colorToEpdiy(color), framebuffer_);
 }
 
+void EpdiyDisplay::drawPixel8bit(int16_t x, int16_t y, uint8_t gray)
+{
+  ensureInit();
+  if (!framebuffer_) return;
+
+  epd_draw_pixel(x, y, gray, framebuffer_);
+}
+
 void EpdiyDisplay::firstPage()
 {
   ensureInit();

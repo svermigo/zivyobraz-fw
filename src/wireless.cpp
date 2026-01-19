@@ -19,6 +19,16 @@ void APCallback(WiFiManager *wm)
     userlCallback();
 }
 
+#ifdef USE_EPDIY_DRIVER
+// Reboot after saving WiFi credentials to get clean epdiy display state
+void saveConfigCallback()
+{
+  Logger::log<Logger::Topic::WIFI>("WiFi credentials saved, rebooting for clean display...\n");
+  delay(500);
+  ESP.restart();
+}
+#endif
+
 void init(const String &hostname, const String &password, void (*callback)())
 {
   // Connecting to WiFi
@@ -40,6 +50,12 @@ void init(const String &hostname, const String &password, void (*callback)())
   userlCallback = callback;
   wm.setConfigPortalTimeout(240); // set portal time to 4 min, then sleep/try again.
   wm.setAPCallback(APCallback);
+
+#ifdef USE_EPDIY_DRIVER
+  // Reboot after saving credentials for clean display state
+  wm.setSaveConfigCallback(saveConfigCallback);
+#endif
+
   wm.autoConnect(hostname.c_str(), password.c_str());
 }
 

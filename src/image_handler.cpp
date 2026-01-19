@@ -24,22 +24,22 @@
 #include "state_manager.h"
 #include "streaming_handler.h"
 
-// GxEPD2 color constants - needed for color conversion functions
-#ifdef USE_EPDIY_DRIVER
-  #include "epdiy_gxepd2_bridge.h"
-#else
-  #ifdef TYPE_BW
-    #include <GxEPD2_BW.h>
-  #elif defined TYPE_3C
-    #include <GxEPD2_3C.h>
-  #elif defined TYPE_4C
-    #include <GxEPD2_4C.h>
-  #elif defined TYPE_GRAYSCALE
-    #include "GxEPD2_4G_4G.h"
-    #include "GxEPD2_4G_BW.h"
-  #elif defined TYPE_7C
-    #include <GxEPD2_7C.h>
+#ifdef TYPE_BW
+  #include <GxEPD2_BW.h>
+#elif defined TYPE_3C
+  #include <GxEPD2_3C.h>
+#elif defined TYPE_4C
+  #include <GxEPD2_4C.h>
+#elif defined TYPE_GRAYSCALE
+  #include "GxEPD2_4G_4G.h"
+  #include "GxEPD2_4G_BW.h"
+#elif defined TYPE_7C
+  #include <GxEPD2_7C.h>
+#elif defined TYPE_8G
+  #ifndef USE_EPDIY_DRIVER
+    #error "TYPE_8G requires USE_EPDIY_DRIVER (epdiy only)."
   #endif
+  #include "epdiy_gxepd2_bridge.h"
 #endif
 
 #include <pngle.h>
@@ -86,7 +86,7 @@ static void printReadError(uint32_t bytesRead)
 
 static uint16_t getSecondColor()
 {
-#if (defined TYPE_BW) || (defined TYPE_GRAYSCALE)
+#if defined(TYPE_BW) || defined(TYPE_GRAYSCALE) || defined(TYPE_8G)
   return GxEPD_LIGHTGREY;
 #else
   return GxEPD_RED;
@@ -95,7 +95,7 @@ static uint16_t getSecondColor()
 
 static uint16_t getThirdColor()
 {
-#if (defined TYPE_BW) || (defined TYPE_GRAYSCALE)
+#if defined(TYPE_BW) || defined(TYPE_GRAYSCALE) || defined(TYPE_8G)
   return GxEPD_DARKGREY;
 #else
   return GxEPD_YELLOW;
@@ -126,6 +126,27 @@ static uint16_t mapColorValue(uint8_t pixelColor, uint16_t color2, uint16_t colo
       return GxEPD_WHITE;
   }
 }
+
+#ifdef TYPE_8G
+// Map Z-format pixel color (0-7) to 8-bit grayscale output
+// Input: 3-bit color index from Z3 format (8 levels)
+// Output: 8-bit grayscale value for epdiy driver
+static uint8_t mapColorValue8bit(uint8_t pixelColor)
+{
+  switch (pixelColor)
+  {
+    case 0x0: return 0xFF; // White
+    case 0x1: return 0x00; // Black
+    case 0x2: return 0xEE; // Light grey 1
+    case 0x3: return 0xBB; // Dark grey 1
+    case 0x4: return 0xDD; // Light grey 2
+    case 0x5: return 0xCC; // Light grey 3
+    case 0x6: return 0x99; // Dark grey 2
+    case 0x7: return 0x55; // Dark grey 3
+    default:  return 0xFF; // White
+  }
+}
+#endif
 
 ///////////////////////////////////////////////
 // Direct Streaming Context
@@ -264,6 +285,20 @@ static void finalizeDirectStream()
 // PNG Image Processing
 ///////////////////////////////////////////////
 
+#ifdef TYPE_8G
+// Convert RGBA to 8-bit grayscale (16 levels: 0x00, 0x11, ... 0xFF)
+// Used for PNG processing in 8-level grayscale color model
+static uint8_t rgbaToGray8bit(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+  if (a == 0)
+    return 0xFF; // Transparent = white
+
+  // Standard luminance formula, then quantize to 16 levels (0x00, 0x11, ... 0xFF)
+  uint8_t gray = (r * 77 + g * 150 + b * 29) >> 8;
+  return (gray >> 4) * 0x11;
+}
+#endif
+
 // Convert RGBA to display color (unified color mapping for all image formats)
 static uint16_t rgbaToDisplayColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
 {
@@ -312,6 +347,19 @@ static uint16_t rgbaToDisplayColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
     return GxEPD_DARKGREY;
   return GxEPD_BLACK;
 
+#elif defined(TYPE_8G)
+  // 8-level grayscale fallback - maps to 4 GxEPD levels
+  // Note: Main PNG path uses rgbaToGray8bit() for full 16-level grayscale.
+  // This branch exists for direct streaming mode compatibility (currently disabled for epdiy).
+  uint8_t gray = (r * 77 + g * 150 + b * 29) >> 8;
+  if (gray > 192)
+    return GxEPD_WHITE;
+  if (gray > 128)
+    return GxEPD_LIGHTGREY;
+  if (gray > 64)
+    return GxEPD_DARKGREY;
+  return GxEPD_BLACK;
+
 #else
   uint8_t gray = (r * 77 + g * 150 + b * 29) >> 8;
   return (gray <= 160) ? GxEPD_BLACK : GxEPD_WHITE;
@@ -327,8 +375,14 @@ static void pngleOnDraw(pngle_t *pngle, uint32_t x, uint32_t y, uint32_t w, uint
     return;
   }
 
+#ifdef TYPE_8G
+  // 8-level grayscale: use direct 8-bit grayscale values
+  uint8_t gray = rgbaToGray8bit(rgba[0], rgba[1], rgba[2], rgba[3]);
+  Display::drawPixel8bit(x, y, gray);
+#else
   uint16_t color = rgbaToDisplayColor(rgba[0], rgba[1], rgba[2], rgba[3]);
   Display::drawPixel(x, y, color);
+#endif
 
   // Yield periodically to prevent watchdog timeout
   static uint32_t pixelCount = 0;
@@ -657,8 +711,11 @@ static bool processRLE(HttpClient &http, uint32_t startTime, ImageFormat format,
   uint16_t h = Display::getResolutionY();
   uint32_t totalPixels = w * h;
 
+#ifndef TYPE_8G
+  // Color mapping for non-8G displays (TYPE_8G uses mapColorValue8bit instead)
   uint16_t color2 = getSecondColor();
   uint16_t color3 = getThirdColor();
+#endif
 
   uint16_t row = 0;
   uint16_t col = 0;
@@ -736,12 +793,21 @@ static bool processRLE(HttpClient &http, uint32_t startTime, ImageFormat format,
       }
     }
 
+#ifdef TYPE_8G
+    // 8-level grayscale: use direct 8-bit grayscale values
+    uint8_t gray = mapColorValue8bit(pixelColor);
+#else
     uint16_t color = mapColorValue(pixelColor, color2, color3);
+#endif
 
     // Draw pixels
     for (uint8_t i = 0; i < count && pixelsProcessed < totalPixels; i++)
     {
+#ifdef TYPE_8G
+      Display::drawPixel8bit(col, row, gray);
+#else
       Display::drawPixel(col, row, color);
+#endif
       pixelsProcessed++;
 
       if (++col >= w)

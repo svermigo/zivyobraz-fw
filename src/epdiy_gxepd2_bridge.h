@@ -58,6 +58,10 @@ public:
   void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color);
   void drawPixel(int16_t x, int16_t y, uint16_t color) override;
 
+  // Direct 8-bit grayscale pixel drawing (bypasses GxEPD2 4-level limitation)
+  // gray: 0x00 (black) to 0xFF (white), supports 16 levels (0x00, 0x11, ... 0xFF)
+  void drawPixel8bit(int16_t x, int16_t y, uint8_t gray);
+
   void firstPage();
   bool nextPage();
   uint16_t pages() const;
