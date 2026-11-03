@@ -321,7 +321,14 @@ AtResult waitResponse(uint32_t timeoutMs, String *response)
 // not followed by a newline. Anything else that arrives first is a whole line:
 // a URC is dispatched (a close must not be lost), and a final error ends the
 // wait at once instead of being left in the stream for the next command.
-bool waitForPrompt(uint32_t timeoutMs)
+enum class Prompt : uint8_t
+{
+  Ready,   // '>' seen, the module waits for the payload
+  Error,   // final error, the stream is back in step
+  Timeout  // nothing conclusive; a late '>' may still come
+};
+
+Prompt waitForPrompt(uint32_t timeoutMs)
 {
   uint32_t deadline = millis() + timeoutMs;
   String line;
@@ -335,7 +342,7 @@ bool waitForPrompt(uint32_t timeoutMs)
 
     char c = (char)modem.read();
     if (c == '>' && (line.length() == 0 || line == "\r"))
-      return true;
+      return Prompt::Ready;
 
     if (c != '\n')
     {
@@ -352,20 +359,35 @@ bool waitForPrompt(uint32_t timeoutMs)
       if (line.startsWith("+IP ERROR") || isFinalError(line))
       {
         drainQuiet(300, 1000); // the plain ERROR after a +IP ERROR
-        return false;
+        return Prompt::Error;
       }
       handleUrc(line);
     }
     line = "";
   }
+  return Prompt::Timeout;
+}
 
-  // The '>' may still be on its way. If it comes after we gave up, the module
-  // sits in data mode and would swallow the next commands as payload - ESC
-  // aborts a pending send, then let whatever answer it gives drain away.
-  modem.write((uint8_t)0x1B);
-  modem.flush();
-  drainQuiet(300, 2000);
-  return false;
+// After a prompt timeout the '>' may still be on its way. If it comes, the
+// module sits in fixed-length data mode and would swallow the next `len`
+// bytes - AT+CIPCLOSE included - as payload; ESC does not cancel that mode.
+// Feed it the bytes it waits for (the request has failed anyway and the
+// caller closes the socket), then let its answer drain away.
+void abandonPendingSend(size_t len)
+{
+  if (waitForPrompt(1500) == Prompt::Ready)
+  {
+    Logger::log<Logger::Level::WARNING, Logger::Topic::LTE>("Late '>' prompt, flushing {} filler bytes\n", len);
+    const uint8_t filler[64] = {0};
+    for (size_t left = len; left > 0;)
+    {
+      size_t n = min(left, sizeof(filler));
+      modem.write(filler, n);
+      left -= n;
+    }
+    modem.flush();
+  }
+  drainQuiet(300, 3000);
 }
 
 // Reads exactly `len` raw bytes (binary safe, no line parsing).
@@ -536,6 +558,55 @@ void applyPower(bool on)
   digitalWrite(LTE_PIN_PWR_EN, on ? HIGH : LOW);
   g_poweredOn = on;
   rtc_modemPowered = on;
+}
+
+// Whether the module may still be running from before this boot. RTC memory
+// is reinitialised on any reset other than a deep sleep wake, but the parked
+// module's pads are latched (gpio_hold_en) and RTC pad holds survive a
+// software reset - so with LTE_KEEP_POWERED a module parked before
+// ESP.restart() (OTA, credentials reset, button) is still powered. Treating it
+// as such means a graceful wake (or CPOF) instead of cutting its supply; one
+// that is in fact off does not answer and gets power-cycled from cold.
+bool mayStillBePowered()
+{
+  if (rtc_modemPowered)
+    return true;
+  #ifdef LTE_KEEP_POWERED
+  const esp_reset_reason_t reason = esp_reset_reason();
+  return reason == ESP_RST_SW || reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT ||
+         reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT;
+  #else
+  return false;
+  #endif
+}
+
+bool syncAt(uint32_t timeoutMs); // defined right below
+
+// Gets the module talking at either baud rate. A module that kept running
+// still sits at LTE_BAUD, so try that first there instead of polling the boot
+// baud for the whole boot budget; a freshly powered one starts at the boot
+// baud, unless AT+IPR was persisted, which the short second try covers.
+bool syncAnyBaud(bool fastFirst)
+{
+  if (LTE_BAUD != LTE_BOOT_BAUD && fastFirst)
+  {
+    modem.updateBaudRate(LTE_BAUD);
+    if (syncAt(3000))
+      return true;
+    modem.updateBaudRate(LTE_BOOT_BAUD);
+  }
+
+  if (syncAt(LTE_BOOT_TIMEOUT_MS))
+    return true;
+
+  if (LTE_BAUD != LTE_BOOT_BAUD && !fastFirst)
+  {
+    modem.updateBaudRate(LTE_BAUD);
+    if (syncAt(3000))
+      return true;
+    modem.updateBaudRate(LTE_BOOT_BAUD);
+  }
+  return false;
 }
 
 // Hammer "AT" until the module answers.
@@ -1109,22 +1180,7 @@ bool begin()
   g_wasReady = false;
   g_begun = true;
 
-  // Whether the module may still be running from before this boot. RTC memory
-  // is reinitialised on any reset other than a deep sleep wake, but a pad held
-  // high survives a software reset - so with LTE_KEEP_POWERED a module parked
-  // before ESP.restart() (OTA, credentials reset, button) is still powered.
-  // Treat it as such: a graceful wake beats cutting its supply, and if it does
-  // not answer, the power-cycle below handles it.
-  bool maybePowered = rtc_modemPowered;
-  #ifdef LTE_KEEP_POWERED
-  if (!maybePowered)
-  {
-    const esp_reset_reason_t reason = esp_reset_reason();
-    if (reason == ESP_RST_SW || reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT ||
-        reason == ESP_RST_WDT)
-      maybePowered = true;
-  }
-  #endif
+  const bool maybePowered = mayStillBePowered();
   // A cold start announces itself once. A module we only assume is running
   // may in fact boot now, so expect its boot URC there too.
   g_expectBootUrc = !rtc_modemPowered;
@@ -1169,17 +1225,7 @@ bool begin()
   // so even when the modem never answers.
   Logger::log<Logger::Topic::LTE>("VBAT at power-up: {} V\n", String(Board::getBatteryVoltage(), 2));
 
-  bool talking = syncAt(LTE_BOOT_TIMEOUT_MS);
-
-  // AT+IPR may be persistent in the module, in which case it now answers at
-  // the fast rate even after a power cycle.
-  if (!talking && LTE_BAUD != LTE_BOOT_BAUD)
-  {
-    modem.updateBaudRate(LTE_BAUD);
-    talking = syncAt(3000);
-    if (!talking)
-      modem.updateBaudRate(LTE_BOOT_BAUD);
-  }
+  bool talking = syncAnyBaud(wasKeptPowered);
 
   // A module kept powered across deep sleep that no longer answers is wedged.
   // Re-sending AT will not fix that and leaving EN high would repeat it on
@@ -1191,14 +1237,7 @@ bool begin()
     delay(LTE_POWER_SETTLE_MS);
     g_expectBootUrc = true;
     applyPower(true);
-    talking = syncAt(LTE_BOOT_TIMEOUT_MS);
-    if (!talking && LTE_BAUD != LTE_BOOT_BAUD)
-    {
-      modem.updateBaudRate(LTE_BAUD);
-      talking = syncAt(3000);
-      if (!talking)
-        modem.updateBaudRate(LTE_BOOT_BAUD);
-    }
+    talking = syncAnyBaud(false);
   }
 
   if (!talking)
@@ -1373,6 +1412,11 @@ void shutdown()
     writeCommand("AT+CSCLK=1");
     waitResponse(2000, nullptr);
     digitalWrite(LTE_PIN_DTR, HIGH); // DTR high -> module sleeps
+    // Latch both pads right away, not only at deep sleep: an ESP.restart()
+    // (OTA, credentials reset) would otherwise drop EN and cut the supply of
+    // a module that never got AT+CPOF. begin() releases the hold again.
+    gpio_hold_en((gpio_num_t)LTE_PIN_PWR_EN);
+    gpio_hold_en((gpio_num_t)LTE_PIN_DTR);
     g_parked = true;
     Logger::log<Logger::Topic::LTE>("Modem parked in sleep mode (DTR high)\n");
     return;
@@ -1418,7 +1462,11 @@ void prepareForDeepSleep()
   pinMode(LTE_PIN_DTR, OUTPUT);
   // After begin() g_poweredOn is the truth (only still true after a park). If
   // begin() never ran this boot (button paths that go straight back to sleep),
-  // keep the level the pads were latched at, which rtc_modemPowered recorded.
+  // keep the level rtc_modemPowered recorded. Deliberately not the reset-reason
+  // guess begin() uses: without the UART check it can't tell a running module
+  // from one that is off, and wrongly holding EN high would power a searching
+  // modem through the whole sleep. The cost is the rare restart-then-straight-
+  // to-sleep sequence cutting a parked module without AT+CPOF.
   const bool keepPowered = g_begun ? g_poweredOn : rtc_modemPowered;
   digitalWrite(LTE_PIN_PWR_EN, keepPowered ? HIGH : LOW);
   digitalWrite(LTE_PIN_DTR, keepPowered ? HIGH : LOW); // DTR high -> module stays in CSCLK sleep
@@ -1602,8 +1650,11 @@ int socketSend(const uint8_t *data, size_t len)
     snprintf(cmd, sizeof(cmd), "AT+CIPSEND=0,%u", (unsigned)chunk);
     writeCommand(cmd);
 
-    if (!waitForPrompt(10000))
+    const Prompt prompt = waitForPrompt(10000);
+    if (prompt != Prompt::Ready)
     {
+      if (prompt == Prompt::Timeout)
+        abandonPendingSend(chunk);
       Logger::log<Logger::Level::ERROR, Logger::Topic::LTE>("No '>' prompt for CIPSEND\n");
       return sent > 0 ? (int)sent : -1;
     }

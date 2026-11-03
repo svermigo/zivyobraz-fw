@@ -170,7 +170,8 @@ bool HttpClient::sendRequest(bool timestampCheck)
   // that cannot come.
   if (!m_client.connected())
   {
-    m_sleepDuration = noteLteServerFailure();
+    if (timestampCheck) // the image request must not override the server's sleep
+      m_sleepDuration = noteLteServerFailure();
     return false;
   }
 #endif
