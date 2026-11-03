@@ -1,3 +1,5 @@
+#ifndef USE_LTE_MODEM
+
 #include "improv_handler.h"
 #include "board.h"
 #include "display.h"
@@ -93,3 +95,24 @@ void busyCallback(const void *)
 }
 
 } // namespace ImprovHandler
+
+#else // USE_LTE_MODEM
+
+// Improv provisions Wi-Fi credentials over serial - meaningless on a cellular
+// build, but main.cpp still references the handler, so keep no-op stubs.
+  #include "improv_handler.h"
+
+namespace ImprovHandler
+{
+void begin() {}
+
+void loop() {}
+
+void end() {}
+
+bool isActive() { return false; }
+
+void busyCallback(const void *) {}
+} // namespace ImprovHandler
+
+#endif // !USE_LTE_MODEM

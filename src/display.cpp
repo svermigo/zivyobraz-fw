@@ -720,7 +720,11 @@ void showNoWiFiError(uint64_t sleepSeconds, const String &wikiUrl)
     display.fillRect(0, 0, DISPLAY_RESOLUTION_X, DISPLAY_RESOLUTION_Y, GxEPD_WHITE);
     display.setTextColor(GxEPD_BLACK);
     display.setFont(DISPLAY_RESOLUTION_X >= 1200 ? &OpenSansSB_24px : &OpenSansSB_20px);
+#ifdef USE_LTE_MODEM
+    centeredText("Cannot connect to mobile network", DISPLAY_RESOLUTION_X / 2, DISPLAY_RESOLUTION_Y / 2 - 15);
+#else
     centeredText("Cannot connect to Wi-Fi", DISPLAY_RESOLUTION_X / 2, DISPLAY_RESOLUTION_Y / 2 - 15);
+#endif
     display.setFont(DISPLAY_RESOLUTION_X >= 1200 ? &OpenSansSB_24px : &OpenSansSB_16px);
     centeredText("Retries in " + String((sleepSeconds + 30) / 60) + " minutes.", DISPLAY_RESOLUTION_X / 2,
                  DISPLAY_RESOLUTION_Y / 2 + 15);

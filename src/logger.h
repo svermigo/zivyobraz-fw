@@ -30,6 +30,7 @@ public:
     HEADER,
     HTTP,
     IMAGE,
+    LTE,
     SENS,
     STREAM,
     SYSTEM,
@@ -103,6 +104,7 @@ private:
            : topic == Topic::HEADER  ? "HEADER "
            : topic == Topic::HTTP    ? "HTTP   "
            : topic == Topic::IMAGE   ? "IMAGE  "
+           : topic == Topic::LTE     ? "LTE    "
            : topic == Topic::SENS    ? "SENSOR "
            : topic == Topic::STREAM  ? "STREAM "
            : topic == Topic::SYSTEM  ? "SYSTEM "

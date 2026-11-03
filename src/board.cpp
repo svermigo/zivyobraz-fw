@@ -33,6 +33,10 @@ static SFE_MAX1704X lipo(MAX1704X_MAX17048);
   #include <driver/i2c.h>
 #endif
 
+#ifdef USE_LTE_MODEM
+  #include "lte_modem.h"
+#endif
+
 namespace Board
 {
 
@@ -95,6 +99,12 @@ void enterDeepSleepMode(uint64_t sleepDuration)
 {
   // Safety net: ensure ePaper power is off before deep sleep regardless of code path
   setEPaperPowerOn(false);
+
+#ifdef USE_LTE_MODEM
+  // Power down (or park) the modem and latch its control pins - the ESP32
+  // tri-states its pads in deep sleep, so EN/DTR must be held explicitly.
+  LteModem::prepareForDeepSleep();
+#endif
 
   // Enter deep sleep
 #ifdef M5StackCoreInk
@@ -434,7 +444,11 @@ DeviceInfo getDeviceInfo()
   String savedSSID = Wireless::getSSID();
   if (savedSSID.length() > 0)
   {
+#ifdef USE_LTE_MODEM
+    info.runtime += " | Operator: "; // Wireless::getSSID() is the operator name on LTE
+#else
     info.runtime += " | SSID: ";
+#endif
     info.runtime += savedSSID;
   }
 

@@ -7,7 +7,13 @@
 #include "state_manager.h"
 #include "wireless.h"
 
+#ifdef USE_LTE_MODEM
+  #include "lte_modem.h"
+
+  #include <Update.h>
+#else
 #include <HTTPUpdate.h>
+#endif
 
 // External configuration
 extern const char *host;
@@ -55,7 +61,16 @@ void HttpClient::buildJsonPayload()
 
   // Network info
   JsonObject network = m_jsonDoc["network"].to<JsonObject>();
+#ifdef USE_LTE_MODEM
+  // "ssid" carries the network identity the device is attached to; on cellular
+  // that is the operator, with the extra modem details alongside it.
+  network["ssid"] = LteModem::getOperator();
+  network["type"] = "lte";
+  network["imei"] = LteModem::getImei();
+  network["apn"] = LteModem::getApn();
+#else
   network["ssid"] = WiFi.SSID();
+#endif
   network["rssi"] = Wireless::getStrength();
   network["mac"] = Wireless::getMacAddress();
   network["apRetries"] = StateManager::getFailureCount();
@@ -229,12 +244,20 @@ bool HttpClient::parseHeaders(bool checkTimestampOnly, uint64_t storedTimestamp)
       }
     }
 
+#ifdef USE_LTE_MODEM
+    // Log every header line, not just the status line - on a cellular link the
+    // full block is what you need when the server answers something unexpected.
+    Logger::log<Logger::Level::DEBUG, Logger::Topic::HTTP>("{}\n", line);
+#endif
+
     // Check for successful HTTP response (always check)
     if (!connectionOk)
     {
       // Support both HTTP/1.0 and HTTP/1.1
       connectionOk = line.startsWith("HTTP/1.1 200 OK") || line.startsWith("HTTP/1.0 200 OK");
+#ifndef USE_LTE_MODEM
       Logger::log<Logger::Level::DEBUG, Logger::Topic::HTTP>("{}\n", line);
+#endif
     }
 
     // End of headers
@@ -269,6 +292,22 @@ bool HttpClient::parseHeaders(bool checkTimestampOnly, uint64_t storedTimestamp)
   {
     // Always save sleep duration from server, even if no update is needed
     StateManager::setSleepDuration(m_sleepDuration);
+
+#ifdef USE_LTE_MODEM
+    // A response without the Timestamp header carries no image - the server
+    // answers this way when there is nothing new to draw. Falling through would
+    // report an update, find no image data, and then still refresh the display
+    // from the empty framebuffer, wiping whatever is on screen.
+    if (!foundTimestamp && !m_otaRequired)
+    {
+      Logger::log<Logger::Level::WARNING, Logger::Topic::HTTP>(
+        "No Timestamp header in response, keeping current screen\n");
+
+      StateManager::setLastRefreshDuration(0);
+
+      return false;
+    }
+#endif
 
     if (foundTimestamp && (m_serverTimestamp == storedTimestamp))
     {
@@ -401,6 +440,178 @@ uint16_t HttpClient::read16()
   return result;
 }
 
+#ifdef USE_LTE_MODEM
+
+// Cellular OTA. HTTPUpdate is hardwired to WiFiClient, so the download is done
+// by hand here: fetch the image over the modem socket and feed it to Update.
+bool HttpClient::performOTAUpdate()
+{
+  if (!m_otaRequired || m_otaUrl.length() == 0)
+  {
+    Logger::log<Logger::Level::WARNING, Logger::Topic::SYSTEM>("No OTA update URL available\n");
+    return false;
+  }
+
+  stop();
+
+  String url = m_otaUrl;
+
+  // Follow at most one redirect (CDNs commonly bounce /latest to a versioned file)
+  for (uint8_t hop = 0; hop < 2; hop++)
+  {
+    if (url.startsWith("https://"))
+    {
+      // No TLS over the modem socket - retry the same resource unencrypted.
+      Logger::log<Logger::Level::WARNING, Logger::Topic::SYSTEM>(
+        "OTA URL is HTTPS, retrying over plain HTTP (no TLS on the modem)\n");
+      url = "http://" + url.substring(8);
+    }
+
+    if (!url.startsWith("http://"))
+    {
+      Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>("Unsupported OTA URL: {}\n", url);
+      return false;
+    }
+
+    // Split "host[:port]/path"
+    String rest = url.substring(7);
+    int slash = rest.indexOf('/');
+    String hostPart = (slash < 0) ? rest : rest.substring(0, slash);
+    String path = (slash < 0) ? "/" : rest.substring(slash);
+
+    uint16_t port = 80;
+    int colon = hostPart.indexOf(':');
+    if (colon > 0)
+    {
+      port = (uint16_t)hostPart.substring(colon + 1).toInt();
+      hostPart = hostPart.substring(0, colon);
+    }
+
+    Logger::log<Logger::Level::INFO, Logger::Topic::SYSTEM>("Starting OTA update from: {}\n", url);
+
+    if (!m_client.connect(hostPart.c_str(), port))
+    {
+      Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>("OTA: connect to {} failed\n", hostPart);
+      return false;
+    }
+
+    m_client.print("GET ");
+    m_client.print(path);
+    m_client.print(" HTTP/1.1\r\nHost: ");
+    m_client.print(hostPart);
+    m_client.print("\r\nConnection: close\r\n\r\n");
+
+    // Read the status line and headers
+    int statusCode = 0;
+    int32_t contentLength = -1;
+    String location;
+
+    while (m_client.connected() || m_client.available())
+    {
+      String line = m_client.readStringUntil('\n');
+      line.trim();
+
+      if (line.length() == 0)
+        break; // end of headers
+
+      if (statusCode == 0 && line.startsWith("HTTP/1."))
+      {
+        int sp = line.indexOf(' ');
+        statusCode = (sp > 0) ? line.substring(sp + 1).toInt() : 0;
+      }
+      else if (line.startsWith("Content-Length:"))
+      {
+        contentLength = line.substring(15).toInt();
+      }
+      else if (line.startsWith("Location:"))
+      {
+        location = line.substring(9);
+        location.trim();
+      }
+    }
+
+    if ((statusCode == 301 || statusCode == 302 || statusCode == 307 || statusCode == 308) && location.length() > 0)
+    {
+      Logger::log<Logger::Topic::SYSTEM>("OTA: following redirect to {}\n", location);
+      stop();
+      url = location;
+      continue;
+    }
+
+    if (statusCode != 200)
+    {
+      Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>("OTA: server returned status {}\n", statusCode);
+      stop();
+      return false;
+    }
+
+    if (contentLength <= 0)
+    {
+      // Update needs the exact size upfront; chunked responses aren't supported.
+      Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>("OTA: missing or invalid Content-Length\n");
+      stop();
+      return false;
+    }
+
+    if (!Update.begin((size_t)contentLength))
+    {
+      Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>("OTA: not enough space for {} bytes ({})\n",
+                                                               contentLength, Update.errorString());
+      stop();
+      return false;
+    }
+
+    Logger::log<Logger::Topic::SYSTEM>("OTA: downloading {} bytes...\n", contentLength);
+
+    uint8_t buffer[512];
+    int32_t written = 0;
+    while (written < contentLength)
+    {
+      int32_t wanted = min((int32_t)sizeof(buffer), contentLength - written);
+      uint32_t got = readBytes(buffer, wanted);
+      if (got == 0)
+        break; // readBytes already logged the timeout
+
+      if (Update.write(buffer, got) != got)
+      {
+        Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>("OTA: flash write failed ({})\n",
+                                                                 Update.errorString());
+        Update.abort();
+        stop();
+        return false;
+      }
+      written += (int32_t)got;
+    }
+
+    stop();
+
+    if (written != contentLength)
+    {
+      Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>("OTA: truncated download, {} of {} bytes\n", written,
+                                                               contentLength);
+      Update.abort();
+      return false;
+    }
+
+    if (!Update.end(true))
+    {
+      Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>("OTA update failed: {}\n", Update.errorString());
+      return false;
+    }
+
+    Logger::log<Logger::Level::INFO, Logger::Topic::SYSTEM>("OTA update successful, restarting...\n");
+    LteModem::shutdown();
+    delay(100);
+    ESP.restart();
+    return true;
+  }
+
+  Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>("OTA: too many redirects\n");
+  return false;
+}
+
+#else // USE_LTE_MODEM
+
 bool HttpClient::performOTAUpdate()
 {
   if (!m_otaRequired || m_otaUrl.length() == 0)
@@ -441,3 +652,5 @@ bool HttpClient::performOTAUpdate()
       return false;
   }
 }
+
+#endif // !USE_LTE_MODEM

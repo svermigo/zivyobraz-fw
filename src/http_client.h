@@ -1,6 +1,14 @@
 #ifndef HTTP_CLIENT_H
 #define HTTP_CLIENT_H
 
+#ifdef USE_LTE_MODEM
+  // The cellular build talks plain HTTP over a raw TCP socket on the modem -
+  // the A7682E TLS stack is a separate AT command set and is not wired up.
+  #include "lte_client.h"
+  #define CONNECTION_PORT 80
+  #define CONNECTION_URL_PREFIX "http://"
+#else
+
 // Select http/https connection type (default: https)
 #ifndef USE_CLIENT_HTTP
   #define USE_CLIENT_HTTPS
@@ -16,9 +24,13 @@
   #define CONNECTION_URL_PREFIX "https://"
 #endif
 
+#endif // USE_LTE_MODEM
+
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#ifndef USE_LTE_MODEM
 #include <WiFi.h>
+#endif
 
 class HttpClient
 {
@@ -70,10 +82,14 @@ public:
   uint16_t read16();
 
 private:
+#ifdef USE_LTE_MODEM
+  LteClient m_client;
+#else
 #ifdef USE_CLIENT_HTTP
   WiFiClient m_client;
 #else
   WiFiClientSecure m_client;
+#endif
 #endif
 
   // Server response data

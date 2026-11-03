@@ -76,6 +76,83 @@ These environment automatically set:
 
 If your display requires a specific VCOM voltage (might be referred on sticker placed on display), uncomment and adjust the `-D EPDIY_VCOM=1500` build flag.
 
+
+### LTE instead of Wi-Fi (SIMCom A7682E)
+
+The `sverio_paperboard_epdiy_lte` environment replaces Wi-Fi with a SIMCom A7682E 4G modem.
+Everything else (display handling, sensors, image streaming, deep sleep, OTA) behaves exactly as
+in the Wi-Fi builds. It is enabled by `-D USE_LTE_MODEM`; without that define the firmware is
+built exactly as before.
+
+```ini
+[env:sverio_paperboard_epdiy_lte]
+```
+
+The modem board mates with the Paperboard's `U11` (SH 1.0 mm, 6 pin) through a straight 1:1 cable:
+
+| Carrier `J3` | Paperboard `U11` | Silk | GPIO | Signal |
+| ------------ | ---------------- | ---- | ---- | ------ |
+| 1 | 1 | — | — | GND |
+| 2 | 2 | — | — | not connected |
+| 3 | 3 | D9  | 10 | `MCU_RX` ← modem TX |
+| 4 | 4 | D10 | 11 | `MCU_TX` → modem RX |
+| 5 | 5 | D11 | 12 | `DTR` — LOW = awake, HIGH = allow sleep |
+| 6 | 6 | D12 | 13 | `EN` — HIGH = modem powered, LOW = hard off |
+
+These GPIOs are the upper half of the EPDiy parallel bus and are unused by 8-bit displays.
+Override them with `-D LTE_PIN_RX=…`, `-D LTE_PIN_TX=…`, `-D LTE_PIN_PWR_EN=…`, `-D LTE_PIN_DTR=…`.
+
+Two modem boards use this connector and these semantics:
+
+- **`lte-a7682e-carrier`** (recommended) carries the A7682E itself. `EN` switches the module's VBAT
+  through a load switch, the board pulses `PWRKEY` on its own at power-up, a level shifter bridges
+  the module's 1.8 V UART, and the bulk capacitance sits right at the module.
+- **`lte-a7682e-daughter`** is the earlier board: `EN` enables a 5 V boost feeding a third-party
+  carrier. It works, but the transmit bursts during network attach can brown the 5 V rail out unless
+  it carries roughly 2 mF of bulk.
+
+Both pull `EN` down, so a floating pad (MCU in reset, cable unplugged) leaves the modem off.
+
+Build flags:
+
+- `-D USE_LTE_MODEM` — enables the cellular stack (`lte_modem.cpp`, `lte_client.cpp`,
+  `wireless_lte.cpp`) and compiles out Wi-Fi, WiFiManager and Improv. Communication is plain HTTP
+  over a raw TCP socket on the modem; the module's TLS stack is a separate AT command set that is
+  not wired up.
+- `-D LTE_APN='"internet"'` — force an APN. When left out, the APN offered by the network
+  (`AT+CGNAPN`) or the SIM default is used. An APN stored in NVS under the key `apn` takes
+  precedence over both.
+- `-D LTE_BAUD=115200` — the default: no `AT+IPR` switch. 460800 cuts a 30 kB image from about
+  4 s to 1.3 s, but some A7682E samples reboot on the switch itself, so it is opt-in.
+- `-D LTE_KEEP_POWERED` — keep the modem registered between refreshes and park it in `AT+CSCLK`
+  sleep instead of cutting `EN`. Wakes faster, but the module keeps drawing a few mA, so this is
+  only sensible on mains power.
+- `-D LTE_FORCE_BAND=20` — pin the LTE search to a single band. A low band (20 = 800 MHz,
+  8 = 900 MHz) has less path loss than 2100 MHz, so the network commands lower transmit power.
+  Only useful where that band has coverage.
+- `-D LTE_PREFER_LTE_ONLY=0` — skip the LTE-only step of a cold search and go straight to all
+  bands including GSM. The LTE-only step is on by default because GSM's TDMA bursts are the
+  harshest load the supply sees.
+- `-D LTE_RADIO_SETTLE_MS=1500` — quiet time with the radio parked (`AT+CFUN=0`) before the first
+  search.
+- `-D LTE_POWER_OFF_GRACE_MS=2000` — time between `AT+CPOF` and cutting `EN`. The module answers
+  `OK` before it has saved its state, and a hard power cut in that window can corrupt its flash.
+
+Bring-up walks an escalation ladder, gentlest first: the remembered band, then every LTE band, then
+everything including GSM. The operator, access technology and band of the last successful attach
+are cached in NVS through the existing `Wireless::saveConnectionCache()` hook, so the server's
+`ForceWifiFullScan` header clears the cellular cache too. The cache is tied to the modem's IMEI and
+is dropped when a different module is fitted.
+
+`begin()` logs a phase breakdown (`[4584 ms] module booted, AT responding`, …), the battery voltage
+at power-up, any unexpected module restart, and — when registration fails — the signal level and
+the full radio state (`CFUN`, `COPS`, `CNMP`, `CNBP`, `CPIN`, `CPSI`). With
+`-D LOG_LEVEL_MINIMUM=Logger::Level::DEBUG` the whole AT conversation is logged as well.
+
+There is no configuration portal in this build. If the modem cannot attach, the device shows the
+offline screen and retries after deep sleep with the usual exponential backoff. Holding the button
+for more than 6 s clears the stored APN instead of the Wi-Fi credentials.
+
 After successfully compiling and flashing the board, continue with the documentation "Bringing your own ePaper to life":
 https://wiki.zivyobraz.eu/doku.php?id=start#oziveni_vlastniho_epaperu
 

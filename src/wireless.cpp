@@ -1,3 +1,7 @@
+// The LTE build replaces this module with wireless_lte.cpp, which exposes the
+// identical Wireless:: API on top of the cellular modem.
+#ifndef USE_LTE_MODEM
+
 #include "wireless.h"
 
 #include "improv_handler.h"
@@ -340,3 +344,5 @@ void resetCredentialsAndReboot()
   ESP.restart();
 }
 } // namespace Wireless
+
+#endif // !USE_LTE_MODEM
