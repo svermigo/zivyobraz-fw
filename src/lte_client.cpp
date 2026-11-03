@@ -69,8 +69,9 @@ size_t LteClient::write(const uint8_t *buf, size_t size)
     g_txLen += chunk;
     written += chunk;
 
+    // A failed flush discards the buffer, this call's last chunk included
     if (g_txLen == sizeof(g_txBuffer) && !flushTx())
-      return written;
+      return written - chunk;
   }
 
   return written;
@@ -162,7 +163,10 @@ int LteClient::read(uint8_t *buf, size_t size)
     size -= chunk;
     total += (int)chunk;
   }
-  return total > 0 ? total : -1;
+  // Like WiFiClient: 0 means "nothing yet", -1 only once the stream is over
+  if (total == 0 && !connected())
+    return -1;
+  return total;
 }
 
 int LteClient::peek()

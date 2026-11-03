@@ -96,6 +96,16 @@
     #define LTE_PREFER_LTE_ONLY 1
   #endif
 
+  // The module's complete band mask, written whenever the search is widened.
+  // It must be a known constant rather than read back from the module: AT+CNBP
+  // is persistent in the module's NVM and this firmware narrows it itself, so a
+  // value read back later may already be narrowed - widening to it would pin
+  // the device to one band for good. This is what two A7682E-LASA samples
+  // reported before anything was written to them (GSM, LTE, TD-SCDMA masks).
+  #ifndef LTE_FULL_BAND_SCOPE
+    #define LTE_FULL_BAND_SCOPE "0X0000000000000180,0X00000000000800C5,0X0000"
+  #endif
+
   // Pin the LTE search to one band. A low band (20 = 800 MHz, 8 = 900 MHz) has
   // far less path loss than 2100 MHz, so the network commands a lower transmit
   // power - which directly shrinks the current burst a weak supply has to take.

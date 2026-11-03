@@ -23,6 +23,39 @@ extern const char *firmware;
 static constexpr uint32_t TOTAL_TIMEOUT_MS = 30000;
 static constexpr uint32_t IDLE_TIMEOUT_MS = 5000;
 
+#ifdef USE_LTE_MODEM
+// Consecutive wake-ups on which the modem attached but the server could not be
+// reached. main.cpp resets its own failure count as soon as the link is up, so
+// on LTE - where each attempt costs a whole modem bring-up - a server outage
+// would otherwise be retried every two minutes for as long as it lasts.
+RTC_DATA_ATTR static uint8_t rtc_lteServerFailures = 0;
+
+static uint64_t noteLteServerFailure()
+{
+  if (rtc_lteServerFailures < 255)
+    rtc_lteServerFailures++;
+
+  // Same steps StateManager::calculateSleepDuration() uses for a missing link
+  uint64_t seconds = rtc_lteServerFailures <= 3    ? StateManager::DEFAULT_SLEEP_SECONDS
+                     : rtc_lteServerFailures <= 10 ? 600
+                     : rtc_lteServerFailures <= 20 ? 1800
+                     : rtc_lteServerFailures <= 50 ? 3600
+                                                   : 43200;
+  StateManager::setSleepDuration(seconds);
+  Logger::log<Logger::Level::WARNING, Logger::Topic::HTTP>("Server unreachable over LTE ({} in a row), next try in {} s\n",
+                                                           rtc_lteServerFailures, (unsigned long)seconds);
+  return seconds;
+}
+
+// Header names are case-insensitive (RFC 9110), and proxies on a plain-HTTP
+// cellular path do rewrite them.
+static bool headerIs(const String &line, const char *name)
+{
+  size_t len = strlen(name);
+  return line.length() >= len && line.substring(0, len).equalsIgnoreCase(name);
+}
+#endif
+
 HttpClient::HttpClient()
     : m_sleepDuration(StateManager::DEFAULT_SLEEP_SECONDS),
       m_serverTimestamp(0),
@@ -52,6 +85,11 @@ void HttpClient::buildJsonPayload()
   m_jsonDoc["apiVersion"] = firmware;  // tells server what are firmware capabilities, same as fwVersion in our case
   m_jsonDoc["buildDate"] = BUILD_DATE; // got from scripts/set_build_date.py before build
   m_jsonDoc["board"] = Board::getBoardType();
+#ifdef USE_LTE_MODEM
+  // The LTE build shares its board string with the Wi-Fi Paperboard build. Say
+  // which one this is, so the server never offers it a Wi-Fi image over OTA.
+  m_jsonDoc["fwVariant"] = "lte";
+#endif
 
   // System info
   JsonObject system = m_jsonDoc["system"].to<JsonObject>();
@@ -127,6 +165,16 @@ bool HttpClient::sendRequest(bool timestampCheck)
       delay(200);
   }
 
+#ifdef USE_LTE_MODEM
+  // Don't write into a socket that never opened and then wait 10 s for a reply
+  // that cannot come.
+  if (!m_client.connected())
+  {
+    m_sleepDuration = noteLteServerFailure();
+    return false;
+  }
+#endif
+
   // Send HTTP/HTTPS POST request with JSON body
   Logger::log<Logger::Level::DEBUG, Logger::Topic::HTTP>("Sending POST to: {}{}/index.php\n", CONNECTION_URL_PREFIX,
                                                          host);
@@ -164,6 +212,9 @@ bool HttpClient::sendRequest(bool timestampCheck)
       m_client.stop();
       if (timestampCheck)
         m_sleepDuration = StateManager::DEFAULT_SLEEP_SECONDS;
+#ifdef USE_LTE_MODEM
+      m_sleepDuration = noteLteServerFailure();
+#endif
       return false;
     }
   }
@@ -175,6 +226,9 @@ bool HttpClient::parseHeaders(bool checkTimestampOnly, uint64_t storedTimestamp)
 {
   bool connectionOk = false;
   bool foundTimestamp = false;
+#ifdef USE_LTE_MODEM
+  int32_t lteBodyLength = -1; // Content-Length, -1 when absent
+#endif
   m_hasRotation = false;
   m_partialRefresh = false;
   m_otaRequired = false;
@@ -183,6 +237,11 @@ bool HttpClient::parseHeaders(bool checkTimestampOnly, uint64_t storedTimestamp)
   while (m_client.connected() || m_client.available())
   {
     String line = m_client.readStringUntil('\n');
+
+#ifdef USE_LTE_MODEM
+    if (headerIs(line, "Content-Length:"))
+      lteBodyLength = line.substring(15).toInt();
+#endif
 
     // Parse headers only when checking timestamp
     if (checkTimestampOnly)
@@ -195,6 +254,20 @@ bool HttpClient::parseHeaders(bool checkTimestampOnly, uint64_t storedTimestamp)
         m_otaRequired = true;
         Logger::log<Logger::Topic::HEADER>("OTA Update requested: {}\n", m_otaUrl);
       }
+
+#if defined(USE_LTE_MODEM) && !defined(LTE_ALLOW_OTA)
+      // OTA over LTE is off unless built with LTE_ALLOW_OTA: it runs over plain
+      // HTTP, and until the server tells LTE and Wi-Fi builds apart it could
+      // hand this device the Wi-Fi image. Ignoring the request (rather than
+      // failing it) lets the normal image refresh go ahead.
+      if (m_otaRequired)
+      {
+        Logger::log<Logger::Level::WARNING, Logger::Topic::HEADER>(
+          "OTA requested but disabled in the LTE build (LTE_ALLOW_OTA), ignoring\n");
+        m_otaRequired = false;
+        m_otaUrl = "";
+      }
+#endif
 
       // Parse Timestamp header
       if (line.startsWith("Timestamp"))
@@ -259,6 +332,10 @@ bool HttpClient::parseHeaders(bool checkTimestampOnly, uint64_t storedTimestamp)
       Logger::log<Logger::Level::DEBUG, Logger::Topic::HTTP>("{}\n", line);
 #endif
     }
+#ifdef USE_LTE_MODEM
+    if (connectionOk)
+      rtc_lteServerFailures = 0; // the server answered
+#endif
 
     // End of headers
     if (line == "\r")
@@ -294,14 +371,15 @@ bool HttpClient::parseHeaders(bool checkTimestampOnly, uint64_t storedTimestamp)
     StateManager::setSleepDuration(m_sleepDuration);
 
 #ifdef USE_LTE_MODEM
-    // A response without the Timestamp header carries no image - the server
-    // answers this way when there is nothing new to draw. Falling through would
-    // report an update, find no image data, and then still refresh the display
-    // from the empty framebuffer, wiping whatever is on screen.
-    if (!foundTimestamp && !m_otaRequired)
+    // An empty body carries no image - the server answers this way when there
+    // is nothing new to draw, and then also omits the Timestamp header, so the
+    // code below would take it for an update, find no image data, and refresh
+    // the display from an empty framebuffer, wiping what is on screen. Test the
+    // body length rather than the missing Timestamp: a response that does carry
+    // an image without Timestamp (a pairing screen, say) must still be drawn.
+    if (lteBodyLength == 0 && !m_otaRequired)
     {
-      Logger::log<Logger::Level::WARNING, Logger::Topic::HTTP>(
-        "No Timestamp header in response, keeping current screen\n");
+      Logger::log<Logger::Level::WARNING, Logger::Topic::HTTP>("Empty response body, keeping current screen\n");
 
       StateManager::setLastRefreshDuration(0);
 
@@ -455,10 +533,19 @@ bool HttpClient::performOTAUpdate()
   stop();
 
   String url = m_otaUrl;
+  String fetched; // the URL requested last, to spot an https redirect loop
 
   // Follow at most one redirect (CDNs commonly bounce /latest to a versioned file)
   for (uint8_t hop = 0; hop < 2; hop++)
   {
+    if (url.startsWith("https://") && fetched == "http://" + url.substring(8))
+    {
+      // We downgraded this very URL and the server sent us back to HTTPS.
+      Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>(
+        "OTA: server insists on HTTPS for {}, which the modem socket cannot do\n", url);
+      return false;
+    }
+
     if (url.startsWith("https://"))
     {
       // No TLS over the modem socket - retry the same resource unencrypted.
@@ -488,6 +575,7 @@ bool HttpClient::performOTAUpdate()
     }
 
     Logger::log<Logger::Level::INFO, Logger::Topic::SYSTEM>("Starting OTA update from: {}\n", url);
+    fetched = url;
 
     if (!m_client.connect(hostPart.c_str(), port))
     {
@@ -505,6 +593,7 @@ bool HttpClient::performOTAUpdate()
     int statusCode = 0;
     int32_t contentLength = -1;
     String location;
+    String md5;
 
     while (m_client.connected() || m_client.available())
     {
@@ -519,19 +608,30 @@ bool HttpClient::performOTAUpdate()
         int sp = line.indexOf(' ');
         statusCode = (sp > 0) ? line.substring(sp + 1).toInt() : 0;
       }
-      else if (line.startsWith("Content-Length:"))
+      else if (headerIs(line, "Content-Length:"))
       {
         contentLength = line.substring(15).toInt();
       }
-      else if (line.startsWith("Location:"))
+      else if (headerIs(line, "Location:"))
       {
         location = line.substring(9);
         location.trim();
+      }
+      else if (headerIs(line, "x-MD5:"))
+      {
+        // Same integrity check HTTPUpdate does on Wi-Fi when the server sends it
+        md5 = line.substring(6);
+        md5.trim();
       }
     }
 
     if ((statusCode == 301 || statusCode == 302 || statusCode == 307 || statusCode == 308) && location.length() > 0)
     {
+      if (location.startsWith("/"))
+      {
+        // Relative reference (RFC 9110): same scheme, host and port
+        location = "http://" + hostPart + (port != 80 ? ":" + String(port) : String()) + location;
+      }
       Logger::log<Logger::Topic::SYSTEM>("OTA: following redirect to {}\n", location);
       stop();
       url = location;
@@ -557,6 +657,14 @@ bool HttpClient::performOTAUpdate()
     {
       Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>("OTA: not enough space for {} bytes ({})\n",
                                                                contentLength, Update.errorString());
+      stop();
+      return false;
+    }
+
+    if (md5.length() == 32 && !Update.setMD5(md5.c_str()))
+    {
+      Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>("OTA: invalid x-MD5 header: {}\n", md5);
+      Update.abort();
       stop();
       return false;
     }

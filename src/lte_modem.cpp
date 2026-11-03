@@ -26,6 +26,8 @@ HardwareSerial modem(LTE_UART_NUM);
 
 bool g_poweredOn = false;
 bool g_ready = false;
+bool g_responsive = false; // the module answered AT during this bring-up
+bool g_parked = false;     // LTE_KEEP_POWERED: already put to CSCLK sleep
 
 int8_t g_rssi = 0;
 String g_operator;
@@ -39,9 +41,15 @@ bool g_sockRemoteClosed = false;
 bool g_sockDataPending = false;
 int g_sockPendingRest = 0;
 
-// Set while waiting for the asynchronous +CIPOPEN result
+// Set while waiting for the asynchronous +CIPOPEN result. Pending = issued and
+// not yet resolved, so a socket the modem may still be opening gets closed.
 bool g_cipopenSeen = false;
 int g_cipopenResult = -1;
+bool g_cipopenPending = false;
+
+// Set when the asynchronous confirmation of AT+CIPCLOSE / AT+NETCLOSE arrives,
+// so waiting for it can end as soon as it is in rather than after a fixed time.
+bool g_closeConfirmed = false;
 
 // AT+CIPSEND answers "OK" as soon as it has swallowed the payload and only
 // later confirms the actual transmission with "+CIPSEND: <id>,<req>,<cnf>".
@@ -63,6 +71,7 @@ uint8_t g_moduleRestarts = 0;
 bool g_expectBootUrc = false;
 
 constexpr uint32_t UART_RX_BUFFER = 8192;
+constexpr size_t AT_LINE_MAX = 512;
 
 // Start of the current begin() call, for the phase timing breakdown below.
 uint32_t g_beginStart = 0;
@@ -80,12 +89,6 @@ void readSignalQuality();                                        // defined furt
 void phase(const String &name)
 {
   Logger::log<Logger::Topic::LTE>("  [{} ms] {}\n", millis() - g_beginStart, name);
-}
-
-void drainInput()
-{
-  while (modem.available())
-    modem.read();
 }
 
 void writeCommand(const char *cmd)
@@ -119,6 +122,7 @@ bool handleUrc(const String &line)
   if (line.startsWith("+CIPCLOSE:") || line.startsWith("+NETCLOSE:"))
   {
     // Async confirmation of a close we already issued; nothing to decide.
+    g_closeConfirmed = true;
     return true;
   }
   if (line.startsWith("+CIPSEND:"))
@@ -133,13 +137,18 @@ bool handleUrc(const String &line)
     int comma = line.indexOf(',');
     g_cipopenResult = (comma > 0) ? line.substring(comma + 1).toInt() : -1;
     g_cipopenSeen = true;
+    if (g_cipopenResult != 0)
+      g_cipopenPending = false; // failed to open: nothing to close
     return true;
   }
   if (line.startsWith("+CIPEVENT:"))
   {
+    // The IP stack has been torn down (e.g. "NETWORK CLOSED UNEXPECTEDLY"): it
+    // needs a fresh NETOPEN, so make further connects fail fast.
     Logger::log<Logger::Level::WARNING, Logger::Topic::LTE>("Network event: {}\n", line);
     g_sockRemoteClosed = true;
     g_sockOpen = false;
+    g_ready = false;
     return true;
   }
   if (line == "RDY" || line.startsWith("*ATREADY"))
@@ -154,6 +163,11 @@ bool handleUrc(const String &line)
       g_moduleRestarts++;
     Logger::log<Logger::Level::WARNING, Logger::Topic::LTE>("Module restarted unexpectedly ({} this bring-up)\n",
                                                             g_moduleRestarts);
+    // A restart loses echo, the receive mode and the IP stack: whatever this
+    // session set up is gone, so stop pretending the link is usable.
+    g_ready = false;
+    g_sockOpen = false;
+    g_sockRemoteClosed = true;
     return true;
   }
 
@@ -187,17 +201,48 @@ bool readLineRaw(String &out, uint32_t timeoutMs)
         out.remove(out.length() - 1);
       return true;
     }
-    out += c;
+    // No AT line is anywhere near this long. Stop growing the String on a
+    // stream that has lost its line framing (wrong baud, stray payload).
+    if (out.length() < AT_LINE_MAX)
+      out += c;
   }
   return false;
 }
 
 bool isFinalOk(const String &line) { return line == "OK" || line == "SHUT OK"; }
 
+// "+IP ERROR: <text>" is deliberately absent: on the A76xx it is followed by a
+// separate plain "ERROR", and treating it as final would leave that ERROR in
+// the stream as the answer to the next command.
 bool isFinalError(const String &line)
 {
-  return line == "ERROR" || line.startsWith("+CME ERROR") || line.startsWith("+CMS ERROR") ||
-         line.startsWith("+IP ERROR") || line == "NO CARRIER";
+  return line == "ERROR" || line.startsWith("+CME ERROR") || line.startsWith("+CMS ERROR") || line == "NO CARRIER";
+}
+
+// Reads and dispatches lines until the link has been quiet for quietMs (or
+// maxMs passed). Used to get back in step after a timeout: a final result code
+// that arrives late would otherwise be read as the answer to the next command,
+// and every response after it would be off by one.
+void drainQuiet(uint32_t quietMs, uint32_t maxMs)
+{
+  uint32_t deadline = millis() + maxMs;
+  uint32_t lastActivity = millis();
+  while ((int32_t)(millis() - deadline) < 0)
+  {
+    String line;
+    if (readLineRaw(line, 50))
+    {
+      if (line.length() > 0)
+      {
+        Logger::log<Logger::Level::DEBUG, Logger::Topic::LTE>("<< (late) {}\n", line);
+        handleUrc(line);
+      }
+      lastActivity = millis();
+      continue;
+    }
+    if (millis() - lastActivity >= quietMs)
+      return;
+  }
 }
 
 // Collects intermediate lines into `response` (newline separated) until a final
@@ -209,6 +254,7 @@ AtResult waitResponse(uint32_t timeoutMs, String *response)
 
   uint32_t deadline = millis() + timeoutMs;
   String line;
+  String ipError; // "+IP ERROR: ..." seen; the plain ERROR that ends it is still due
 
   while ((int32_t)(millis() - deadline) < 0)
   {
@@ -227,10 +273,21 @@ AtResult waitResponse(uint32_t timeoutMs, String *response)
     if (isFinalOk(line))
       return AtResult::Ok;
 
+    if (line.startsWith("+IP ERROR"))
+    {
+      ipError = line;
+      // The closing "ERROR" follows within milliseconds; don't sit out the
+      // whole timeout of a slow command for it.
+      uint32_t soon = millis() + 1000;
+      if ((int32_t)(soon - deadline) < 0)
+        deadline = soon;
+      continue;
+    }
+
     if (isFinalError(line))
     {
       if (response)
-        *response = line;
+        *response = ipError.length() > 0 ? ipError : line;
       return AtResult::Error;
     }
 
@@ -242,13 +299,25 @@ AtResult waitResponse(uint32_t timeoutMs, String *response)
     }
   }
 
+  if (ipError.length() > 0)
+  {
+    if (response)
+      *response = ipError; // no trailing ERROR came; the +IP ERROR is the answer
+    return AtResult::Error;
+  }
+
+  drainQuiet(300, 2000);
   return AtResult::Timeout;
 }
 
-// Waits for the bare '>' data prompt emitted by AT+CIPSEND.
+// Waits for the '>' data prompt of AT+CIPSEND. The prompt starts a line and is
+// not followed by a newline. Anything else that arrives first is a whole line:
+// a URC is dispatched (a close must not be lost), and a final error ends the
+// wait at once instead of being left in the stream for the next command.
 bool waitForPrompt(uint32_t timeoutMs)
 {
   uint32_t deadline = millis() + timeoutMs;
+  String line;
   while ((int32_t)(millis() - deadline) < 0)
   {
     if (!modem.available())
@@ -256,8 +325,31 @@ bool waitForPrompt(uint32_t timeoutMs)
       delay(1);
       continue;
     }
-    if ((char)modem.read() == '>')
+
+    char c = (char)modem.read();
+    if (c == '>' && (line.length() == 0 || line == "\r"))
       return true;
+
+    if (c != '\n')
+    {
+      if (line.length() < AT_LINE_MAX)
+        line += c;
+      continue;
+    }
+
+    if (line.endsWith("\r"))
+      line.remove(line.length() - 1);
+    if (line.length() > 0)
+    {
+      Logger::log<Logger::Level::DEBUG, Logger::Topic::LTE>("<< {}\n", line);
+      if (line.startsWith("+IP ERROR") || isFinalError(line))
+      {
+        drainQuiet(300, 1000); // the plain ERROR after a +IP ERROR
+        return false;
+      }
+      handleUrc(line);
+    }
+    line = "";
   }
   return false;
 }
@@ -285,21 +377,6 @@ size_t readRaw(uint8_t *buf, size_t len, uint32_t timeoutMs)
     delay(1);
   }
   return got;
-}
-
-// Reads and dispatches whatever arrives within the given window. Used after
-// commands whose confirmation URC follows the "OK" by some milliseconds.
-void drainUrcs(uint32_t windowMs)
-{
-  uint32_t deadline = millis() + windowMs;
-  while ((int32_t)(millis() - deadline) < 0)
-  {
-    String line;
-    if (!readLineRaw(line, 200) || line.length() == 0)
-      continue;
-    Logger::log<Logger::Level::DEBUG, Logger::Topic::LTE>("<< {}\n", line);
-    handleUrc(line);
-  }
 }
 
 ///////////////////////////////////////////////
@@ -372,13 +449,21 @@ void storeNetworkCache(const NetworkCache &cache)
   prefs.end();
 }
 
+// Preferences::remove() logs an error for a key that does not exist, which
+// reads like NVS trouble in the log - only remove what is there.
+void removeKey(Preferences &prefs, const char *key)
+{
+  if (prefs.isKey(key))
+    prefs.remove(key);
+}
+
 void clearNetworkCache()
 {
   Preferences prefs;
   prefs.begin(NVS_NAMESPACE);
-  prefs.remove("oper");
-  prefs.remove("act");
-  prefs.remove("band");
+  removeKey(prefs, "oper");
+  removeKey(prefs, "act");
+  removeKey(prefs, "band");
   prefs.end();
 }
 
@@ -525,7 +610,7 @@ bool recoverUart(bool *wasReset = nullptr)
 
   writeCommand("ATE0");
   waitResponse(2000, nullptr);
-  drainInput();
+  drainQuiet(200, 1000);
   switchBaud();
   return true;
 }
@@ -548,7 +633,10 @@ bool waitForSim(uint32_t timeoutMs)
 // +CEREG/+CGREG stat 1 (home) or 5 (roaming) means we're on the network.
 // *responded reports whether the modem answered at all, so the caller can tell
 // a plain "not registered yet" apart from a dead UART.
-bool isRegistered(const char *cmd, bool *responded = nullptr)
+// Takes the value from the +CEREG:/+CGREG: line itself - any other line that
+// lands in the response (an unlisted URC, echo after a restart) would otherwise
+// be parsed instead and read as "not registered".
+bool isRegistered(const char *cmd, const char *prefix, bool *responded = nullptr)
 {
   String resp;
   writeCommand(cmd);
@@ -560,12 +648,21 @@ bool isRegistered(const char *cmd, bool *responded = nullptr)
   if (result != AtResult::Ok)
     return false;
 
-  int idx = resp.indexOf(": ");
-  if (idx < 0)
+  String value = extractValue(resp, prefix);
+  if (value.length() == 0)
     return false;
 
-  int stat = csvField(resp.substring(idx + 2), 1).toInt();
+  int stat = csvField(value, 1).toInt();
   return stat == 1 || stat == 5;
+}
+
+bool isRegisteredNow(bool *responded = nullptr)
+{
+  bool lte = false, gsm = false;
+  bool registered = isRegistered("AT+CEREG?", "+CEREG:", &lte) || isRegistered("AT+CGREG?", "+CGREG:", &gsm);
+  if (responded)
+    *responded = lte || gsm;
+  return registered;
 }
 
 bool waitForRegistration(uint32_t timeoutMs)
@@ -575,13 +672,11 @@ bool waitForRegistration(uint32_t timeoutMs)
 
   while ((int32_t)(millis() - deadline) < 0)
   {
-    bool lteAnswered = false;
-    bool gsmAnswered = false;
-
-    if (isRegistered("AT+CEREG?", &lteAnswered) || isRegistered("AT+CGREG?", &gsmAnswered))
+    bool answered = false;
+    if (isRegisteredNow(&answered))
       return true;
 
-    if (lteAnswered || gsmAnswered)
+    if (answered)
     {
       silentPolls = 0;
     }
@@ -714,10 +809,9 @@ void readImei()
   }
 }
 
-// The factory band mask and the cached network describe one particular module.
-// If a different module is now fitted (it happens - carriers get swapped), they
-// are stale: the old mask may not match this variant's bands, and the cached
-// band may not even exist for it. Drop both and start this module afresh.
+// The cached network describes one particular module. If a different module is
+// now fitted (it happens - carriers get swapped), it is stale: the cached band
+// may not even exist for that variant. Drop it and start this module afresh.
 void forgetOtherModule()
 {
   if (g_imei.length() == 0)
@@ -731,10 +825,10 @@ void forgetOtherModule()
     if (known.length() > 0)
       Logger::log<Logger::Topic::LTE>("Different modem fitted (IMEI {} -> {}), discarding its cached settings\n", known,
                                       g_imei);
-    prefs.remove("cnbp0");
-    prefs.remove("oper");
-    prefs.remove("act");
-    prefs.remove("band");
+    removeKey(prefs, "cnbp0"); // band scope stored by earlier builds; no longer used
+    removeKey(prefs, "oper");
+    removeKey(prefs, "act");
+    removeKey(prefs, "band");
     prefs.putString("imei", g_imei);
   }
   prefs.end();
@@ -759,38 +853,6 @@ void readIdentity()
   }
 }
 
-// The module's factory band mask, captured once before we ever narrow it, so
-// widening again never has to guess which bands this variant supports.
-String loadFullBandScope()
-{
-  Preferences prefs;
-  prefs.begin(NVS_NAMESPACE, true);
-  String scope = prefs.getString("cnbp0", "");
-  prefs.end();
-  return scope;
-}
-
-void rememberFullBandScope()
-{
-  if (loadFullBandScope().length() > 0)
-    return;
-
-  String resp;
-  writeCommand("AT+CNBP?");
-  if (waitResponse(3000, &resp) != AtResult::Ok)
-    return;
-
-  String scope = extractValue(resp, "+CNBP:");
-  if (scope.length() == 0)
-    return;
-
-  Preferences prefs;
-  prefs.begin(NVS_NAMESPACE);
-  prefs.putString("cnbp0", scope);
-  prefs.end();
-  Logger::log<Logger::Level::DEBUG, Logger::Topic::LTE>("Stored factory band scope: {}\n", scope);
-}
-
 // Only write +CNMP / +CNBP when the value actually changes - both live in the
 // module's NVM and there is no reason to wear it out every wake-up.
 void setIfDifferent(const char *query, const char *prefix, const char *setCmd, const String &wanted)
@@ -802,7 +864,8 @@ void setIfDifferent(const char *query, const char *prefix, const char *setCmd, c
 
   String cmd = String(setCmd) + wanted;
   writeCommand(cmd.c_str());
-  waitResponse(5000, nullptr);
+  if (waitResponse(5000, nullptr) != AtResult::Ok)
+    Logger::log<Logger::Level::WARNING, Logger::Topic::LTE>("Module rejected {}\n", cmd);
 }
 
 // How wide a net to cast when looking for a network. Each step up costs more
@@ -838,17 +901,13 @@ uint32_t scopeTimeout(SearchScope scope)
 // Must run with the radio parked (AT+CFUN=0) for the changes to take effect.
 void applySearchScope(SearchScope scope, const NetworkCache &cache)
 {
-  // Capture the factory mask on every bring-up, not just when narrowing -
-  // otherwise a device that never registers has nothing to widen back to.
-  rememberFullBandScope();
-
-  const String full = loadFullBandScope();
+  const String full = LTE_FULL_BAND_SCOPE;
 
 #if LTE_FORCE_BAND
   // A hard band pin overrides every scope - there is nothing else to try.
   {
     const String mask = lteBandMask(LTE_FORCE_BAND);
-    if (mask.length() > 0 && full.length() > 0)
+    if (mask.length() > 0)
     {
       String wanted = csvField(full, 0) + "," + mask;
       const String tds = csvField(full, 2);
@@ -868,7 +927,7 @@ void applySearchScope(SearchScope scope, const NetworkCache &cache)
       setIfDifferent("AT+CNMP?", "+CNMP:", "AT+CNMP=", "38");
 
     const String mask = lteBandMask(cache.band);
-    if (mask.length() > 0 && full.length() > 0)
+    if (mask.length() > 0)
     {
       // Keep the GSM and TD-SCDMA fields as they came, replace only the LTE one.
       String wanted = csvField(full, 0) + "," + mask;
@@ -880,9 +939,7 @@ void applySearchScope(SearchScope scope, const NetworkCache &cache)
     return;
   }
 
-  if (full.length() > 0)
-    setIfDifferent("AT+CNBP?", "+CNBP:", "AT+CNBP=", full);
-
+  setIfDifferent("AT+CNBP?", "+CNBP:", "AT+CNBP=", full);
   setIfDifferent("AT+CNMP?", "+CNMP:", "AT+CNMP=", scope == SearchScope::LteOnly ? "38" : "2");
 }
 
@@ -1009,6 +1066,8 @@ bool begin()
   g_beginStart = started;
   g_moduleRestarts = 0;
   g_expectBootUrc = !rtc_modemPowered; // a cold start announces itself once
+  g_responsive = false;
+  g_parked = false;
 
   // The control pins are latched (gpio_hold_en) across deep sleep. Drive the
   // output registers to the level they are currently held at BEFORE releasing
@@ -1023,7 +1082,6 @@ bool begin()
 
   gpio_hold_dis((gpio_num_t)LTE_PIN_PWR_EN);
   gpio_hold_dis((gpio_num_t)LTE_PIN_DTR);
-  gpio_deep_sleep_hold_dis();
 
   modem.setRxBufferSize(UART_RX_BUFFER);
   modem.begin(LTE_BOOT_BAUD, SERIAL_8N1, LTE_PIN_RX, LTE_PIN_TX);
@@ -1049,11 +1107,37 @@ bool begin()
   // so even when the modem never answers.
   Logger::log<Logger::Topic::LTE>("VBAT at power-up: {} V\n", String(Board::getBatteryVoltage(), 2));
 
-  if (!syncAt(LTE_BOOT_TIMEOUT_MS))
+  bool talking = syncAt(LTE_BOOT_TIMEOUT_MS);
+
+  // AT+IPR may be persistent in the module, in which case it now answers at
+  // the fast rate even after a power cycle.
+  if (!talking && LTE_BAUD != LTE_BOOT_BAUD)
+  {
+    modem.updateBaudRate(LTE_BAUD);
+    talking = syncAt(3000);
+    if (!talking)
+      modem.updateBaudRate(LTE_BOOT_BAUD);
+  }
+
+  // A module kept powered across deep sleep that no longer answers is wedged.
+  // Re-sending AT will not fix that and leaving EN high would repeat it on
+  // every wake - power-cycle it and try once more from cold.
+  if (!talking && g_poweredOn)
+  {
+    Logger::log<Logger::Level::WARNING, Logger::Topic::LTE>("Kept-powered modem is not answering, power-cycling it\n");
+    applyPower(false);
+    delay(LTE_POWER_SETTLE_MS);
+    g_expectBootUrc = true;
+    applyPower(true);
+    talking = syncAt(LTE_BOOT_TIMEOUT_MS);
+  }
+
+  if (!talking)
   {
     Logger::log<Logger::Level::ERROR, Logger::Topic::LTE>("Modem did not respond to AT\n");
     return false;
   }
+  g_responsive = true;
   phase("module booted, AT responding");
 
   // Let the module finish its own boot before we configure anything.
@@ -1063,7 +1147,7 @@ bool begin()
 
   writeCommand("ATE0"); // echo off - we parse responses, not our own commands
   waitResponse(2000, nullptr);
-  drainInput();
+  drainQuiet(200, 1000);
 
   writeCommand("AT+CMEE=2"); // verbose errors
   waitResponse(2000, nullptr);
@@ -1102,7 +1186,14 @@ bool begin()
 #endif
   ladder[steps++] = SearchScope::Full;
 
-  bool registered = false;
+  // A module kept powered across deep sleep is normally still registered, and a
+  // cold one can register on its own before we get here. Cycling the radio
+  // would throw that away and redo the attach - the slowest and, on a weak
+  // supply, the riskiest part of the bring-up.
+  bool registered = isRegisteredNow();
+  if (registered)
+    Logger::log<Logger::Topic::LTE>("Already registered, keeping the current attach\n");
+
   for (uint8_t step = 0; step < steps && !registered; step++)
   {
     if (!enableRadio(ladder[step], cache))
@@ -1166,40 +1257,67 @@ bool begin()
 
 bool isReady() { return g_ready; }
 
+// Waits for the asynchronous +CIPCLOSE / +NETCLOSE confirmation, but only as
+// long as it takes to arrive.
+void waitForCloseConfirmation(uint32_t maxMs)
+{
+  uint32_t deadline = millis() + maxMs;
+  while (!g_closeConfirmed && (int32_t)(millis() - deadline) < 0)
+  {
+    String line;
+    if (!readLineRaw(line, 100) || line.length() == 0)
+      continue;
+    Logger::log<Logger::Level::DEBUG, Logger::Topic::LTE>("<< {}\n", line);
+    handleUrc(line);
+  }
+}
+
 void shutdown()
 {
-  if (!g_poweredOn)
+  if (!g_poweredOn || g_parked)
     return;
 
-  if (g_sockOpen)
+  if (g_sockOpen || g_cipopenPending)
     socketClose();
 
   if (g_ready)
   {
+    g_closeConfirmed = false;
     writeCommand("AT+NETCLOSE");
-    waitResponse(10000, nullptr);
-    drainUrcs(1000); // swallow the late "+NETCLOSE: 0"
+    if (waitResponse(10000, nullptr) == AtResult::Ok)
+      waitForCloseConfirmation(1000); // the late "+NETCLOSE: 0"
   }
 
   g_ready = false;
 
   #ifdef LTE_KEEP_POWERED
-  // Keep the registration, park the module in low power UART sleep.
-  writeCommand("AT+CSCLK=1");
-  waitResponse(2000, nullptr);
-  digitalWrite(LTE_PIN_DTR, HIGH); // DTR high -> module sleeps
-  Logger::log<Logger::Topic::LTE>("Modem parked in sleep mode (DTR high)\n");
-  #else
+  if (g_responsive)
+  {
+    // Keep the registration, park the module in low power UART sleep.
+    writeCommand("AT+CSCLK=1");
+    waitResponse(2000, nullptr);
+    digitalWrite(LTE_PIN_DTR, HIGH); // DTR high -> module sleeps
+    g_parked = true;
+    Logger::log<Logger::Topic::LTE>("Modem parked in sleep mode (DTR high)\n");
+    return;
+  }
+  // A module that never answered is not worth keeping powered: fall through
+  // and switch it off, so the next wake starts it from cold.
+  #endif
+
   // Graceful detach + power down. "OK" comes back before the module has
   // finished writing its state; cutting the supply in that window can corrupt
   // the module's flash (A7682E manual 3.2.1), so give it the ~2 s it needs.
-  writeCommand("AT+CPOF");
-  waitResponse(5000, nullptr);
-  delay(LTE_POWER_OFF_GRACE_MS);
+  // A module that never answered AT this time has nothing to save.
+  if (g_responsive)
+  {
+    writeCommand("AT+CPOF");
+    waitResponse(5000, nullptr);
+    delay(LTE_POWER_OFF_GRACE_MS);
+  }
   modem.end();
   applyPower(false);
   Logger::log<Logger::Topic::LTE>("Modem powered off (EN low)\n");
-  #endif
 }
 
 void prepareForDeepSleep()
@@ -1213,21 +1331,22 @@ void prepareForDeepSleep()
   // Set the output registers first, then re-latch: if a hold was still active
   // (e.g. we never brought the modem up this cycle) releasing it before the
   // registers are valid would let the pads float for a moment.
+  //
+  // Only these two pads are held. GPIO12/13 are RTC IOs, so gpio_hold_en()
+  // alone keeps them latched through deep sleep; gpio_deep_sleep_hold_en()
+  // is deliberately not used - it would freeze every digital pad (display
+  // control lines included) for the whole sleep, which the Wi-Fi build never
+  // does.
   pinMode(LTE_PIN_PWR_EN, OUTPUT);
   pinMode(LTE_PIN_DTR, OUTPUT);
-  #ifdef LTE_KEEP_POWERED
-  digitalWrite(LTE_PIN_PWR_EN, HIGH);
-  digitalWrite(LTE_PIN_DTR, HIGH); // DTR high -> module stays in CSCLK sleep
-  #else
-  digitalWrite(LTE_PIN_PWR_EN, LOW);
-  digitalWrite(LTE_PIN_DTR, LOW);
-  #endif
+  const bool keepPowered = g_poweredOn; // only true after a successful park
+  digitalWrite(LTE_PIN_PWR_EN, keepPowered ? HIGH : LOW);
+  digitalWrite(LTE_PIN_DTR, keepPowered ? HIGH : LOW); // DTR high -> module stays in CSCLK sleep
 
   gpio_hold_dis((gpio_num_t)LTE_PIN_PWR_EN);
   gpio_hold_dis((gpio_num_t)LTE_PIN_DTR);
   gpio_hold_en((gpio_num_t)LTE_PIN_PWR_EN);
   gpio_hold_en((gpio_num_t)LTE_PIN_DTR);
-  gpio_deep_sleep_hold_en();
 }
 
 int8_t getRssi() { return g_rssi; }
@@ -1247,7 +1366,7 @@ void setStoredApn(const String &apn)
   if (apn.length() > 0)
     prefs.putString("apn", apn);
   else
-    prefs.remove("apn");
+    removeKey(prefs, "apn");
   prefs.end();
   Logger::log<Logger::Topic::LTE>("Stored APN: {}\n", apn.length() ? apn : String("<cleared>"));
 }
@@ -1319,13 +1438,22 @@ bool socketOpen(const char *host, uint16_t port)
   g_cipopenResult = -1;
 
   char cmd[160];
-  snprintf(cmd, sizeof(cmd), "AT+CIPOPEN=0,\"TCP\",\"%s\",%u", host, (unsigned)port);
+  int len = snprintf(cmd, sizeof(cmd), "AT+CIPOPEN=0,\"TCP\",\"%s\",%u", host, (unsigned)port);
+  if (len < 0 || len >= (int)sizeof(cmd))
+  {
+    Logger::log<Logger::Level::ERROR, Logger::Topic::LTE>("Host name too long for CIPOPEN: {}\n", host);
+    return false;
+  }
   writeCommand(cmd);
+  g_cipopenPending = true;
 
   // "OK" acknowledges the command; the connection result arrives as +CIPOPEN URC
   if (waitResponse(5000, nullptr) != AtResult::Ok && !g_cipopenSeen)
   {
+    // The modem may still be opening the socket - close it, or the next
+    // attempt finds socket 0 in use and a late +CIPOPEN lands on nobody.
     Logger::log<Logger::Level::ERROR, Logger::Topic::LTE>("CIPOPEN rejected\n");
+    socketClose();
     return false;
   }
 
@@ -1349,19 +1477,24 @@ bool socketOpen(const char *host, uint16_t port)
   }
 
   g_sockOpen = true;
+  g_cipopenPending = false;
   Logger::log<Logger::Topic::LTE>("Connected to {}:{}\n", host, port);
   return true;
 }
 
 void socketClose()
 {
-  if (!g_poweredOn)
-    return;
+  // Nothing open and nothing being opened: no AT round trip needed.
+  if (g_poweredOn && (g_sockOpen || g_cipopenPending))
+  {
+    g_closeConfirmed = false;
+    writeCommand("AT+CIPCLOSE=0");
+    // ERROR when it was not open after all - then no confirmation follows.
+    if (waitResponse(10000, nullptr) == AtResult::Ok)
+      waitForCloseConfirmation(1000); // the late "+CIPCLOSE: 0,0"
+  }
 
-  writeCommand("AT+CIPCLOSE=0");
-  waitResponse(10000, nullptr); // ERROR when already closed - harmless
-  drainUrcs(1000);              // swallow the late "+CIPCLOSE: 0,0"
-
+  g_cipopenPending = false;
   g_sockOpen = false;
   g_sockRemoteClosed = false;
   g_sockDataPending = false;
@@ -1476,11 +1609,14 @@ int socketRecv(uint8_t *buf, size_t maxLen, int *rest)
   bool noData = false;
   bool failed = false;
 
+  // One deadline for the whole exchange. Waiting per line instead would give up
+  // on a brief modem stall and abandon a half-read line, after which the late
+  // header and its binary payload would be parsed as AT responses.
   uint32_t deadline = millis() + 15000;
   while ((int32_t)(millis() - deadline) < 0)
   {
     String line;
-    if (!readLineRaw(line, 2000))
+    if (!readLineRaw(line, (uint32_t)(deadline - millis())))
       break;
     if (line.length() == 0)
       continue;
@@ -1532,15 +1668,30 @@ int socketRecv(uint8_t *buf, size_t maxLen, int *rest)
     }
 
     if (failed)
+    {
       Logger::log<Logger::Level::WARNING, Logger::Topic::LTE>("CIPRXGET rejected\n");
+    }
     else
+    {
       Logger::log<Logger::Level::WARNING, Logger::Topic::LTE>("CIPRXGET: no data header\n");
+      drainQuiet(300, 2000);
+    }
     return -1;
   }
 
   String value = header.substring(header.indexOf(": ") + 2);
   int readLen = csvField(value, 2).toInt();
   int restLen = csvField(value, 3).toInt();
+
+  // Never trust a length beyond what was asked for: buf is a fixed buffer, and
+  // a corrupted header would otherwise have us write past its end.
+  if (readLen < 0 || (size_t)readLen > maxLen)
+  {
+    Logger::log<Logger::Level::ERROR, Logger::Topic::LTE>("CIPRXGET header claims {} bytes, asked for {}\n", readLen,
+                                                          (unsigned)maxLen);
+    drainQuiet(300, 2000);
+    return -1;
+  }
 
   g_sockPendingRest = restLen;
   if (rest)

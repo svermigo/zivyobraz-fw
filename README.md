@@ -120,8 +120,9 @@ Build flags:
   over a raw TCP socket on the modem; the module's TLS stack is a separate AT command set that is
   not wired up.
 - `-D LTE_APN='"internet"'` — force an APN. When left out, the APN offered by the network
-  (`AT+CGNAPN`) or the SIM default is used. An APN stored in NVS under the key `apn` takes
-  precedence over both.
+  (`AT+CGNAPN`) or the SIM default is used. The firmware also honours an APN in NVS under the key
+  `apn` (it takes precedence), but nothing in this firmware writes one yet; the long button press
+  clears it.
 - `-D LTE_BAUD=115200` — the default: no `AT+IPR` switch. 460800 cuts a 30 kB image from about
   4 s to 1.3 s, but some A7682E samples reboot on the switch itself, so it is opt-in.
 - `-D LTE_KEEP_POWERED` — keep the modem registered between refreshes and park it in `AT+CSCLK`
@@ -137,12 +138,25 @@ Build flags:
   search.
 - `-D LTE_POWER_OFF_GRACE_MS=2000` — time between `AT+CPOF` and cutting `EN`. The module answers
   `OK` before it has saved its state, and a hard power cut in that window can corrupt its flash.
+- `-D LTE_FULL_BAND_SCOPE='"0X…,0X…,0X…"'` — the module's complete band mask (GSM, LTE, TD-SCDMA)
+  that a widened search writes. Defaults to what the A7682E-LASA reports from the factory; set it
+  for another module variant.
+- `-D LTE_ALLOW_OTA` — enable firmware updates over LTE. **Off by default**: OTA runs over plain
+  HTTP, and the LTE build reports the same `board` as the Wi-Fi Paperboard build, so a server that
+  does not look at the payload's `"fwVariant": "lte"` could hand it the Wi-Fi image. Without the
+  flag an `X-OTA-Update` header is logged and ignored, and the screen refreshes normally.
 
-Bring-up walks an escalation ladder, gentlest first: the remembered band, then every LTE band, then
-everything including GSM. The operator, access technology and band of the last successful attach
-are cached in NVS through the existing `Wireless::saveConnectionCache()` hook, so the server's
-`ForceWifiFullScan` header clears the cellular cache too. The cache is tied to the modem's IMEI and
-is dropped when a different module is fitted.
+If the modem is already registered when bring-up reaches the network step (kept powered, or it
+attached by itself while booting), that attach is kept. Otherwise bring-up walks an escalation
+ladder, gentlest first: the remembered band, then every LTE band, then everything including GSM.
+The operator, access technology and band of the last successful attach are cached in NVS through
+the existing `Wireless::saveConnectionCache()` hook, so the server's `ForceWifiFullScan` header
+clears the cellular cache too. The cache is tied to the modem's IMEI and is dropped when a
+different module is fitted.
+
+If the modem attaches but the server cannot be reached, the LTE build backs off in the same steps
+as for a missing link (2 min, 10 min, 30 min, 1 h, 12 h): `main.cpp` resets its own failure count
+once the link is up, and on LTE every retry costs a whole modem bring-up.
 
 `begin()` logs a phase breakdown (`[4584 ms] module booted, AT responding`, …), the battery voltage
 at power-up, any unexpected module restart, and — when registration fails — the signal level and

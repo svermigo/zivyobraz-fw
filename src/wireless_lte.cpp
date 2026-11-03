@@ -42,6 +42,12 @@ void init(const String &hostname, const String &password, void (*callback)())
   // then let main.cpp render the offline screen and go back to sleep.
   StateManager::incrementFailureCount();
   Logger::log<Logger::Level::ERROR, Logger::Topic::LTE>("Cellular connection failed\n");
+
+  // Switch the modem off now rather than at deep sleep: the offline screen is
+  // drawn next, and an e-paper refresh on top of a modem still searching (and
+  // transmitting attach attempts) is exactly the combined load a weak supply
+  // cannot take - besides being wasted battery.
+  LteModem::shutdown();
 }
 
 void process()
