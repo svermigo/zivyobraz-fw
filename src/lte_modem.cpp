@@ -727,12 +727,29 @@ bool recoverUart(bool *wasReset = nullptr)
 bool waitForSim(uint32_t timeoutMs)
 {
   uint32_t deadline = millis() + timeoutMs;
+  uint8_t notInserted = 0;
   while ((int32_t)(millis() - deadline) < 0)
   {
     String resp;
     writeCommand("AT+CPIN?");
-    if (waitResponse(3000, &resp) == AtResult::Ok && extractValue(resp, "+CPIN:") == "READY")
+    AtResult result = waitResponse(3000, &resp);
+    if (result == AtResult::Ok && extractValue(resp, "+CPIN:") == "READY")
       return true;
+
+    // "SIM not inserted" is definitive once the module has booted - a few
+    // answers in a row are enough, no need to sit out the whole wait.
+    if (result == AtResult::Error && resp.indexOf("not inserted") >= 0)
+    {
+      if (++notInserted >= 3)
+      {
+        Logger::log<Logger::Level::ERROR, Logger::Topic::LTE>("No SIM card inserted\n");
+        return false;
+      }
+    }
+    else
+    {
+      notInserted = 0;
+    }
     delay(500);
   }
   Logger::log<Logger::Level::ERROR, Logger::Topic::LTE>("SIM not ready (missing card or PIN locked)\n");
