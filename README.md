@@ -79,27 +79,30 @@ If your display requires a specific VCOM voltage (might be referred on sticker p
 
 ### LTE instead of Wi-Fi (SIMCom A7682E)
 
-The `sverio_paperboard_epdiy_lte` environment replaces Wi-Fi with a SIMCom A7682E 4G modem.
+The `sverio_paperboard_epdiy_lte` and `sverio_paperboard_spi_lte` environments replace Wi-Fi
+with a SIMCom A7682E 4G modem.
 Everything else (display handling, sensors, image streaming, deep sleep) behaves exactly as
 in the Wi-Fi builds; OTA is off by default (see below). It is enabled by `-D USE_LTE_MODEM`; without that define the firmware is
 built exactly as before.
 
 ```ini
-[env:sverio_paperboard_epdiy_lte]
+[env:sverio_paperboard_epdiy_lte]   ; EPDiy Paperboard (parallel displays)
+[env:sverio_paperboard_spi_lte]     ; SPI Paperboard (GxEPD2 displays, GDEM102T91 by default)
 ```
 
 The modem board mates with the Paperboard's `U11` (SH 1.0 mm, 6 pin) through a straight 1:1 cable:
 
-| Carrier `J3` | Paperboard `U11` | Silk | GPIO | Signal |
-| ------------ | ---------------- | ---- | ---- | ------ |
+| Carrier `J3` | Paperboard `U11` | EPDiy board: silk / GPIO | SPI board: GPIO | Signal |
+| ------------ | ---------------- | ------------------------ | --------------- | ------ |
 | 1 | 1 | — | — | GND |
-| 2 | 2 | — | — | not connected |
-| 3 | 3 | D9  | 10 | `MCU_RX` ← modem TX |
-| 4 | 4 | D10 | 11 | `MCU_TX` → modem RX |
-| 5 | 5 | D11 | 12 | `DTR` — LOW = awake, HIGH = allow sleep |
-| 6 | 6 | D12 | 13 | `EN` — HIGH = modem powered, LOW = hard off |
+| 2 | 2 | — | — (3.3 V on U11) | not connected on the carrier |
+| 3 | 3 | D9 / 10  | 6 | `MCU_RX` ← modem TX |
+| 4 | 4 | D10 / 11 | 7 | `MCU_TX` → modem RX |
+| 5 | 5 | D11 / 12 | 8 | `DTR` — LOW = awake, HIGH = allow sleep |
+| 6 | 6 | D12 / 13 | 9 | `EN` — HIGH = modem powered, LOW = hard off |
 
-These GPIOs are the upper half of the EPDiy parallel bus and are unused by 8-bit displays.
+On the EPDiy board these GPIOs are the upper half of the parallel bus and are unused by 8-bit
+displays; on the SPI board GPIO10–13 drive the display, so `U11` is routed to GPIO6–9 instead.
 Override them with `-D LTE_PIN_RX=…`, `-D LTE_PIN_TX=…`, `-D LTE_PIN_PWR_EN=…`, `-D LTE_PIN_DTR=…`.
 
 Two modem boards use this connector and these semantics:
