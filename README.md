@@ -80,8 +80,8 @@ If your display requires a specific VCOM voltage (might be referred on sticker p
 ### LTE instead of Wi-Fi (SIMCom A7682E)
 
 The `sverio_paperboard_epdiy_lte` environment replaces Wi-Fi with a SIMCom A7682E 4G modem.
-Everything else (display handling, sensors, image streaming, deep sleep, OTA) behaves exactly as
-in the Wi-Fi builds. It is enabled by `-D USE_LTE_MODEM`; without that define the firmware is
+Everything else (display handling, sensors, image streaming, deep sleep) behaves exactly as
+in the Wi-Fi builds; OTA is off by default (see below). It is enabled by `-D USE_LTE_MODEM`; without that define the firmware is
 built exactly as before.
 
 ```ini
@@ -151,11 +151,12 @@ attached by itself while booting), that attach is kept. Otherwise bring-up walks
 ladder, gentlest first: the remembered band, then every LTE band, then everything including GSM.
 The operator, access technology and band of the last successful attach are cached in NVS through
 the existing `Wireless::saveConnectionCache()` hook, so the server's `ForceWifiFullScan` header
-clears the cellular cache too. The cache is tied to the modem's IMEI and is dropped when a
+clears the cellular cache too, and the next bring-up then walks the ladder even if the module
+has already registered by itself on the old band. The cache is tied to the modem's IMEI and is dropped when a
 different module is fitted.
 
 If the modem attaches but the server cannot be reached, the LTE build backs off in the same steps
-as for a missing link (2 min, 10 min, 30 min, 1 h, 12 h): `main.cpp` resets its own failure count
+as for a missing link (2 min, 10 min, 30 min, 1 h, 12 h), whether the server does not answer or answers with an error: `main.cpp` resets its own failure count
 once the link is up, and on LTE every retry costs a whole modem bring-up.
 
 `begin()` logs a phase breakdown (`[4584 ms] module booted, AT responding`, …), the battery voltage

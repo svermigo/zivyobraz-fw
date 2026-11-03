@@ -9,6 +9,7 @@
   #include <Preferences.h>
   #include <driver/gpio.h>
   #include <driver/rtc_io.h>
+  #include <esp_system.h>
 
 extern const char *const NVS_NAMESPACE;
 
@@ -28,6 +29,8 @@ bool g_poweredOn = false;
 bool g_ready = false;
 bool g_responsive = false; // the module answered AT during this bring-up
 bool g_parked = false;     // LTE_KEEP_POWERED: already put to CSCLK sleep
+bool g_begun = false;      // begin() ran this boot (the pads are ours, not latched)
+bool g_wasReady = false;   // this bring-up completed (worth keeping powered)
 
 int8_t g_rssi = 0;
 String g_operator;
@@ -148,6 +151,8 @@ bool handleUrc(const String &line)
     Logger::log<Logger::Level::WARNING, Logger::Topic::LTE>("Network event: {}\n", line);
     g_sockRemoteClosed = true;
     g_sockOpen = false;
+    g_sockDataPending = false; // whatever the modem held went with the stack
+    g_sockPendingRest = 0;
     g_ready = false;
     return true;
   }
@@ -168,6 +173,8 @@ bool handleUrc(const String &line)
     g_ready = false;
     g_sockOpen = false;
     g_sockRemoteClosed = true;
+    g_sockDataPending = false;
+    g_sockPendingRest = 0;
     return true;
   }
 
@@ -351,6 +358,13 @@ bool waitForPrompt(uint32_t timeoutMs)
     }
     line = "";
   }
+
+  // The '>' may still be on its way. If it comes after we gave up, the module
+  // sits in data mode and would swallow the next commands as payload - ESC
+  // aborts a pending send, then let whatever answer it gives drain away.
+  modem.write((uint8_t)0x1B);
+  modem.flush();
+  drainQuiet(300, 2000);
   return false;
 }
 
@@ -464,6 +478,30 @@ void clearNetworkCache()
   removeKey(prefs, "oper");
   removeKey(prefs, "act");
   removeKey(prefs, "band");
+  prefs.end();
+}
+
+// Set when the cache is dropped on request (server asked for a full scan): the
+// module may still register on its own on the old, narrowed band, and keeping
+// that registration would make the request a no-op. Cleared after an attach
+// that went through the ladder.
+bool loadWidenRequest()
+{
+  Preferences prefs;
+  prefs.begin(NVS_NAMESPACE, true);
+  bool widen = prefs.getBool("widen", false);
+  prefs.end();
+  return widen;
+}
+
+void storeWidenRequest(bool widen)
+{
+  Preferences prefs;
+  prefs.begin(NVS_NAMESPACE);
+  if (widen)
+    prefs.putBool("widen", true);
+  else
+    removeKey(prefs, "widen");
   prefs.end();
 }
 
@@ -622,7 +660,7 @@ bool waitForSim(uint32_t timeoutMs)
   {
     String resp;
     writeCommand("AT+CPIN?");
-    if (waitResponse(3000, &resp) == AtResult::Ok && resp.indexOf("READY") >= 0)
+    if (waitResponse(3000, &resp) == AtResult::Ok && extractValue(resp, "+CPIN:") == "READY")
       return true;
     delay(500);
   }
@@ -819,16 +857,17 @@ void forgetOtherModule()
 
   Preferences prefs;
   prefs.begin(NVS_NAMESPACE);
+  removeKey(prefs, "cnbp0"); // band scope stored by earlier builds; no longer used
   String known = prefs.getString("imei", "");
   if (known != g_imei)
   {
     if (known.length() > 0)
       Logger::log<Logger::Topic::LTE>("Different modem fitted (IMEI {} -> {}), discarding its cached settings\n", known,
                                       g_imei);
-    removeKey(prefs, "cnbp0"); // band scope stored by earlier builds; no longer used
     removeKey(prefs, "oper");
     removeKey(prefs, "act");
     removeKey(prefs, "band");
+    removeKey(prefs, "widen");
     prefs.putString("imei", g_imei);
   }
   prefs.end();
@@ -859,7 +898,7 @@ void setIfDifferent(const char *query, const char *prefix, const char *setCmd, c
 {
   String resp;
   writeCommand(query);
-  if (waitResponse(3000, &resp) == AtResult::Ok && extractValue(resp, prefix) == wanted)
+  if (waitResponse(3000, &resp) == AtResult::Ok && extractValue(resp, prefix).equalsIgnoreCase(wanted))
     return;
 
   String cmd = String(setCmd) + wanted;
@@ -1065,15 +1104,38 @@ bool begin()
   uint32_t started = millis();
   g_beginStart = started;
   g_moduleRestarts = 0;
-  g_expectBootUrc = !rtc_modemPowered; // a cold start announces itself once
   g_responsive = false;
   g_parked = false;
+  g_wasReady = false;
+  g_begun = true;
+
+  // Whether the module may still be running from before this boot. RTC memory
+  // is reinitialised on any reset other than a deep sleep wake, but a pad held
+  // high survives a software reset - so with LTE_KEEP_POWERED a module parked
+  // before ESP.restart() (OTA, credentials reset, button) is still powered.
+  // Treat it as such: a graceful wake beats cutting its supply, and if it does
+  // not answer, the power-cycle below handles it.
+  bool maybePowered = rtc_modemPowered;
+  #ifdef LTE_KEEP_POWERED
+  if (!maybePowered)
+  {
+    const esp_reset_reason_t reason = esp_reset_reason();
+    if (reason == ESP_RST_SW || reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT ||
+        reason == ESP_RST_WDT)
+      maybePowered = true;
+  }
+  #endif
+  // A cold start announces itself once. A module we only assume is running
+  // may in fact boot now, so expect its boot URC there too.
+  g_expectBootUrc = !rtc_modemPowered;
+  const bool wasKeptPowered = maybePowered;
 
   // The control pins are latched (gpio_hold_en) across deep sleep. Drive the
   // output registers to the level they are currently held at BEFORE releasing
   // the latch - otherwise the pads would briefly float back to hi-Z and a
   // still-running modem would lose its supply.
-  g_poweredOn = rtc_modemPowered;
+  g_poweredOn = maybePowered;
+  rtc_modemPowered = maybePowered;
 
   pinMode(LTE_PIN_PWR_EN, OUTPUT);
   digitalWrite(LTE_PIN_PWR_EN, g_poweredOn ? HIGH : LOW);
@@ -1122,7 +1184,7 @@ bool begin()
   // A module kept powered across deep sleep that no longer answers is wedged.
   // Re-sending AT will not fix that and leaving EN high would repeat it on
   // every wake - power-cycle it and try once more from cold.
-  if (!talking && g_poweredOn)
+  if (!talking && wasKeptPowered)
   {
     Logger::log<Logger::Level::WARNING, Logger::Topic::LTE>("Kept-powered modem is not answering, power-cycling it\n");
     applyPower(false);
@@ -1130,6 +1192,13 @@ bool begin()
     g_expectBootUrc = true;
     applyPower(true);
     talking = syncAt(LTE_BOOT_TIMEOUT_MS);
+    if (!talking && LTE_BAUD != LTE_BOOT_BAUD)
+    {
+      modem.updateBaudRate(LTE_BAUD);
+      talking = syncAt(3000);
+      if (!talking)
+        modem.updateBaudRate(LTE_BOOT_BAUD);
+    }
   }
 
   if (!talking)
@@ -1190,7 +1259,10 @@ bool begin()
   // cold one can register on its own before we get here. Cycling the radio
   // would throw that away and redo the attach - the slowest and, on a weak
   // supply, the riskiest part of the bring-up.
-  bool registered = isRegisteredNow();
+  const bool widen = loadWidenRequest();
+  bool registered = !widen && isRegisteredNow();
+  if (widen)
+    Logger::log<Logger::Topic::LTE>("Full band search requested, not keeping the current attach\n");
   if (registered)
     Logger::log<Logger::Topic::LTE>("Already registered, keeping the current attach\n");
 
@@ -1249,7 +1321,11 @@ bool begin()
   if (!openIpStack())
     return false;
 
+  if (widen)
+    storeWidenRequest(false);
+
   g_ready = true;
+  g_wasReady = true;
   Logger::log<Logger::Topic::LTE>("Modem ready in {} ms (operator: {})\n", millis() - started,
                                   g_operator.length() ? g_operator : String("unknown"));
   return true;
@@ -1291,7 +1367,7 @@ void shutdown()
   g_ready = false;
 
   #ifdef LTE_KEEP_POWERED
-  if (g_responsive)
+  if (g_responsive && g_wasReady)
   {
     // Keep the registration, park the module in low power UART sleep.
     writeCommand("AT+CSCLK=1");
@@ -1301,8 +1377,9 @@ void shutdown()
     Logger::log<Logger::Topic::LTE>("Modem parked in sleep mode (DTR high)\n");
     return;
   }
-  // A module that never answered is not worth keeping powered: fall through
-  // and switch it off, so the next wake starts it from cold.
+  // A module that never answered, or never got as far as an IP link, is not
+  // worth keeping powered (it would keep searching through the whole sleep):
+  // fall through and switch it off, so the next wake starts it from cold.
   #endif
 
   // Graceful detach + power down. "OK" comes back before the module has
@@ -1339,7 +1416,10 @@ void prepareForDeepSleep()
   // does.
   pinMode(LTE_PIN_PWR_EN, OUTPUT);
   pinMode(LTE_PIN_DTR, OUTPUT);
-  const bool keepPowered = g_poweredOn; // only true after a successful park
+  // After begin() g_poweredOn is the truth (only still true after a park). If
+  // begin() never ran this boot (button paths that go straight back to sleep),
+  // keep the level the pads were latched at, which rtc_modemPowered recorded.
+  const bool keepPowered = g_begun ? g_poweredOn : rtc_modemPowered;
   digitalWrite(LTE_PIN_PWR_EN, keepPowered ? HIGH : LOW);
   digitalWrite(LTE_PIN_DTR, keepPowered ? HIGH : LOW); // DTR high -> module stays in CSCLK sleep
 
@@ -1416,6 +1496,7 @@ void saveNetworkCache()
 void invalidateNetworkCache()
 {
   clearNetworkCache();
+  storeWidenRequest(true);
   Logger::log<Logger::Topic::LTE>("Network cache cleared, next bring-up will search all bands\n");
 }
 
@@ -1710,6 +1791,10 @@ int socketRecv(uint8_t *buf, size_t maxLen, int *rest)
 
   // The modem only re-raises "+CIPRXGET: 1" when new data arrives, so track
   // the buffered remainder ourselves.
+  // A URC dispatched meanwhile may have torn the socket down.
+  if (!g_sockOpen)
+    restLen = 0;
+  g_sockPendingRest = restLen;
   g_sockDataPending = restLen > 0;
 
   return (int)got;

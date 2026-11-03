@@ -213,7 +213,10 @@ bool HttpClient::sendRequest(bool timestampCheck)
       if (timestampCheck)
         m_sleepDuration = StateManager::DEFAULT_SLEEP_SECONDS;
 #ifdef USE_LTE_MODEM
-      m_sleepDuration = noteLteServerFailure();
+      // Only the first request of a cycle decides the sleep; a second (image)
+      // request comes right after the server answered and must not override it.
+      if (timestampCheck)
+        m_sleepDuration = noteLteServerFailure();
 #endif
       return false;
     }
@@ -349,6 +352,12 @@ bool HttpClient::parseHeaders(bool checkTimestampOnly, uint64_t storedTimestamp)
   if (!connectionOk)
   {
     m_sleepDuration = StateManager::DEFAULT_SLEEP_SECONDS;
+#ifdef USE_LTE_MODEM
+    // A server answering 5xx/4xx is as much an outage as one not answering:
+    // back off instead of a full modem bring-up every two minutes.
+    if (checkTimestampOnly)
+      m_sleepDuration = noteLteServerFailure();
+#endif
     return false;
   }
 
@@ -627,7 +636,12 @@ bool HttpClient::performOTAUpdate()
 
     if ((statusCode == 301 || statusCode == 302 || statusCode == 307 || statusCode == 308) && location.length() > 0)
     {
-      if (location.startsWith("/"))
+      if (location.startsWith("//"))
+      {
+        // Scheme-relative reference: keep the current scheme (plain HTTP)
+        location = "http:" + location;
+      }
+      else if (location.startsWith("/"))
       {
         // Relative reference (RFC 9110): same scheme, host and port
         location = "http://" + hostPart + (port != 80 ? ":" + String(port) : String()) + location;
@@ -661,6 +675,7 @@ bool HttpClient::performOTAUpdate()
       return false;
     }
 
+    md5.toLowerCase(); // Update compares against a lowercase hex digest
     if (md5.length() == 32 && !Update.setMD5(md5.c_str()))
     {
       Logger::log<Logger::Level::ERROR, Logger::Topic::SYSTEM>("OTA: invalid x-MD5 header: {}\n", md5);

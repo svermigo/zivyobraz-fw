@@ -105,7 +105,10 @@ bool LteClient::fillRx()
   g_rxLen = 0;
 
   if (!LteModem::socketIsOpen())
+  {
+    m_connected = false;
     return false;
+  }
 
   // Back off after an empty poll so tight read() loops stay cheap
   if (millis() - m_lastEmptyPoll < EMPTY_POLL_INTERVAL_MS)
@@ -199,6 +202,14 @@ uint8_t LteClient::connected()
 
   if (!m_connected)
     return 0;
+
+  // Torn down underneath us (module restart, IP stack lost): nothing more can
+  // come, whatever the last pending-data hint said.
+  if (!LteModem::socketIsOpen())
+  {
+    m_connected = false;
+    return 0;
+  }
 
   if (LteModem::socketRemoteClosed() && !LteModem::socketHasPendingData())
   {
