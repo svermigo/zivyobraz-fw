@@ -75,6 +75,7 @@
 // #define DISPLAY_TYPE GDEY0579F51   // 792x272, 5.79"
 // #define DISPLAY_TYPE GDEY0583F41   // 648x480, 5.83"
 // #define DISPLAY_TYPE GDEM075F52    // 800x480, 7.5"
+// #define DISPLAY_TYPE GDEM075F53    // 800x480, 7.5"
 // #define DISPLAY_TYPE GDEM102F91    // 960x640, 10.2"
 // #define DISPLAY_TYPE GDEY116F51    // 960x640, 11.6"
 // #define DISPLAY_TYPE GDEY116F91    // 960x640, 11.6"
@@ -194,13 +195,14 @@ static constexpr const char COLOR_TYPE_STRING[] = XSTR(COLOR_TYPE);
   #define DT_GDEY0579F51 51
   #define DT_GDEY0583F41 52
   #define DT_GDEM075F52 53
-  #define DT_GDEM102F91 54
-  #define DT_GDEY116F51 55
-  #define DT_GDEY116F91 56
+  #define DT_GDEM075F53 54
+  #define DT_GDEM102F91 55
+  #define DT_GDEY116F51 56
+  #define DT_GDEY116F91 57
   // 7C displays
-  #define DT_GDEP0565D90 57
-  #define DT_GDEY073D46 58
-  #define DT_GDEP073E01 59
+  #define DT_GDEP0565D90 58
+  #define DT_GDEY073D46 59
+  #define DT_GDEP073E01 60
   // epdiy displays (parallel interface)
   #define DT_ED097TC2_EPDIY 100
   #define DT_ED060XC3_EPDIY 101
